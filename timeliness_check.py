@@ -33,8 +33,8 @@ import re
 import signal
 import time
 import json
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, parse_qs
 
 import requests
 
@@ -86,6 +86,13 @@ F_ACTIVITY_STATUS = "fld8cGHyyU0CffP2s"  # Activity status — full scale (creat
 F_LIVELINESS      = "fldbzhgtmZEjH7yaK"  # Liveliness score (created 2026-04-01)
 F_LAST_ACTIVITY   = "fldeRTiBRsmhQJhxx"  # Last activity date (created 2026-04-01)
 F_LAST_CHECK      = "fld8pjefvIqtFYxxO"  # Last timeliness check (created 2026-04-01)
+
+# Human correction of a wrong verdict. Curator sets Activity status to
+# AS_SCORED_WRONG; the next run restores the record's own Status value and
+# ticks F_FALSE_INACTIVE, which exempts it from all future scoring.
+F_FALSE_INACTIVE  = "fldaMAxokw1rgdwO5"  # False inactive (checkbox)
+AS_SCORED_WRONG   = "Claude scored wrong"
+EXEMPT_SCORE      = 100  # score written to an exempted record
 
 # ── Airtable field IDs — Links table ─────────────────────────────────────────
 
@@ -183,6 +190,7 @@ def is_excluded(rec):
     """
     Returns True if the record should be skipped:
     - Already marked Inactive (Status field)
+    - Curator has flagged a wrong verdict (False inactive)
     - Category is graveyard
     - New launch this year (marked 'x')
     - Type contains 'document'
@@ -192,6 +200,11 @@ def is_excluded(rec):
 
     # Already marked Inactive or N/A
     if f.get(F_STATUS) in ("Inactive", "N/A"):
+        return True
+
+    # A curator overruled the algorithm on this record. Leave it alone —
+    # re-scoring it would just overwrite the correction again.
+    if f.get(F_FALSE_INACTIVE):
         return True
 
     # Category is graveyard
@@ -224,35 +237,51 @@ def is_excluded(rec):
     return False
 
 
+NEVER_CHECKED_MAX_PAGES = 5  # 500 records; most of this pool is ineligible
+
+
 def fetch_batch():
     """
     Return the next BATCH_SIZE records to check.
     Priority: never-checked first (empty Last timeliness check), oldest-created first
               within that pool; then oldest-checked first.
     Excludes new launches from the current year.
+
+    Eligibility is applied per page, before deciding whether more records are
+    needed. Filtering only at the end deadlocks the queue: one full page of
+    ineligible records counts as a full batch, so the top-up pass never runs
+    and the batch ends up empty. The same page comes back the next day, so the
+    stall is permanent once the head of the pool is ineligible.
     """
-    collected = []
+    eligible = []
+    offset   = None
 
-    # Pass 1: never checked — fetch a large pool and process oldest-created first
+    # Pass 1: never checked — page through, oldest-created first within a page
     # (newer additions are more likely already active and less urgent to check)
-    data = at_get(LISTINGS_TABLE, {
-        "filterByFormula": f'{{{_field_name(F_LAST_CHECK)}}} = ""',
-        "pageSize": 100,
-    })
-    never_checked = sorted(data.get("records", []), key=lambda r: r.get("createdTime", ""))
-    collected.extend(never_checked)
+    for _ in range(NEVER_CHECKED_MAX_PAGES):
+        params = {
+            "filterByFormula": f'{{{_field_name(F_LAST_CHECK)}}} = ""',
+            "pageSize": 100,
+        }
+        if offset:
+            params["offset"] = offset
+        data = at_get(LISTINGS_TABLE, params)
+        page = sorted(data.get("records", []), key=lambda r: r.get("createdTime", ""))
+        eligible.extend(r for r in page if not is_excluded(r))
+        offset = data.get("offset")
+        if len(eligible) >= BATCH_SIZE or not offset:
+            break
 
-    # Pass 2: oldest checked (if we still need records)
-    if len(collected) < BATCH_SIZE * 2:
+    # Pass 2: oldest checked (only if the never-checked pool came up short)
+    if len(eligible) < BATCH_SIZE:
         data2 = at_get(LISTINGS_TABLE, {
             "filterByFormula": f'{{{_field_name(F_LAST_CHECK)}}} != ""',
-            f"sort[0][field]": F_LAST_CHECK,
-            f"sort[0][direction]": "asc",
+            "sort[0][field]": F_LAST_CHECK,
+            "sort[0][direction]": "asc",
             "pageSize": BATCH_SIZE * 4,
         })
-        collected.extend(data2.get("records", []))
+        eligible.extend(r for r in data2.get("records", []) if not is_excluded(r))
 
-    eligible = [r for r in collected if not is_excluded(r)]
     return eligible[:BATCH_SIZE]
 
 
@@ -269,6 +298,51 @@ def is_na_candidate(rec):
     return False
 
 
+def restore_scored_wrong():
+    """
+    Undo wrong verdicts. A curator reports one by setting Activity status to
+    AS_SCORED_WRONG; this restores the record's own Status value to Activity
+    status and ticks False inactive so later runs leave the record alone.
+
+    Status only carries Active / Inactive / N/A, so N/A and blank both restore
+    to a blank Activity status rather than inventing a value.
+
+    Returns a list of (name, restored_value, stale_score) for the run summary.
+    """
+    data = at_get(LISTINGS_TABLE, {
+        "filterByFormula": f'{{{_field_name(F_ACTIVITY_STATUS)}}} = "{AS_SCORED_WRONG}"',
+        "pageSize": 100,
+    })
+    records = data.get("records", [])
+    if not records:
+        return []
+
+    restored = []
+    updates  = []
+    for rec in records:
+        f       = rec.get("fields", {})
+        status  = f.get(F_STATUS)
+        restore = status if status in ("Active", "Inactive") else None
+        updates.append({
+            "id": rec["id"],
+            "fields": {
+                F_ACTIVITY_STATUS: restore,
+                F_FALSE_INACTIVE:  True,
+                F_LIVELINESS:      EXEMPT_SCORE,
+            },
+        })
+        restored.append((
+            f.get(F_NAME, rec["id"]),
+            restore or "(blank)",
+            f.get(F_LIVELINESS),
+        ))
+
+    for i in range(0, len(updates), 10):
+        at_patch(LISTINGS_TABLE, updates[i : i + 10])
+
+    return restored
+
+
 def fetch_na_candidates():
     """Return records with books format or document type that aren't yet marked N/A."""
     data = at_get(LISTINGS_TABLE, {
@@ -283,8 +357,10 @@ def fetch_na_candidates():
 
 # Field name cache (Airtable formula filters use field names, not IDs)
 _FIELD_NAME_MAP = {
-    F_LAST_CHECK: "Last timeliness check",
-    F_STATUS:     "Status",
+    F_LAST_CHECK:      "Last timeliness check",
+    F_STATUS:          "Status",
+    F_ACTIVITY_STATUS: "Activity status",
+    F_FALSE_INACTIVE:  "False inactive",
 }
 
 def _field_name(fid):
@@ -490,23 +566,80 @@ def find_homepage_in_article(article_url):
 
 # ── Individual signal checks ──────────────────────────────────────────────────
 
+# Hosts that serve snapshots rather than a project. Landing on one of these
+# means the original did not answer, whatever status code comes back.
+#
+# This list is closed. Do not extend it with institutional archives, however
+# archive-like the hostname reads. Membership requires a parseable snapshot URL
+# grammar, because _extract_archive_original() must be able to recover the
+# original and re-check it, and a host recognised here without that grammar
+# lands in the recognised-but-unparseable state that rules a listing dead
+# without a single fetch. Hostnames matching the intuition are also often live
+# canonical homes for real items: arXiv, SSRN, Zenodo, archive.org/details.
+# A host outside this list that redirects into it is already handled, by the
+# effective-URL check in _try_fetch() rather than by name.
+ARCHIVE_HOSTS = (
+    "web.archive.org", "waybackmachine.org",
+    "archive.today", "archive.ph", "archive.is",
+    "archive.li", "archive.vn", "archive.md",
+)
+
+
+def is_archive_host(url):
+    """True if the URL's host serves archive snapshots."""
+    if not url:
+        return False
+    host = urlparse(url).netloc.lower()
+    return any(host == h or host.endswith("." + h) for h in ARCHIVE_HOSTS)
+
+
 def _extract_archive_original(url):
     """
-    Extract the original URL from a web.archive.org link.
-    e.g. https://web.archive.org/web/20180217125651/http://thesponge.eu/
-    returns http://thesponge.eu/
+    Extract the original URL from an archive link, or None.
+
+    web.archive.org/web/20180217125651/http://thesponge.eu/ -> http://thesponge.eu/
+    archive.today/?url=http://example.org/                  -> http://example.org/
+    archive.ph/newest/http://example.org/                   -> http://example.org/
+
+    Every archive host recognised by is_archive_host() must be parseable here.
+    A host recognised as an archive but not parsed returns None, and the caller
+    then rules the listing dead and archived without ever fetching anything,
+    which is a confident wrong answer rather than a miss.
     """
-    m = re.search(r'web\.archive\.org/web/\d+[^/]*/(.+)', url)
+    m = re.search(r'(?:web\.archive\.org|waybackmachine\.org)/web/\d+[^/]*/(.+)', url)
+    if m:
+        return m.group(1)
+    q = parse_qs(urlparse(url).query).get("url")
+    if q and q[0]:
+        return q[0]
+    m = re.search(r'archive\.(?:today|ph|is|li|vn|md)/(?:newest/|\d+/)?(https?://.+)', url)
     if m:
         return m.group(1)
     return None
 
 
-def _try_fetch(url):
-    """Attempt a GET and return (is_alive, exception_type)."""
+WEBSITE_RETRY_DELAY_S = 2
+
+
+def _try_fetch(url, attempt=1):
+    """
+    Attempt a GET and return (is_alive, exception_type).
+
+    A hard connection error is retried once before the site is called dead.
+    Resets, DNS blips and handshakes refused to a datacenter IP are transient
+    or environmental rather than evidence a site is gone, and a single one of
+    them costs a live listing 50 points. Timeouts already return None, so they
+    need no retry.
+    """
     try:
         r = SESSION.get(url, timeout=10, allow_redirects=True, stream=True)
         r.close()
+        # A dead site whose owner points the domain at a snapshot of itself
+        # answers 200 from an archive host. Judge the effective URL, not the
+        # requested one: thesponge.eu 302s to its own 2018 Wayback capture, so
+        # reading the status code alone scores a tombstone as a live site.
+        if is_archive_host(r.url) and not is_archive_host(url):
+            return False, "redirected_to_archive"
         # Bot-blocking responses are indeterminate — don't treat as dead
         if r.status_code in (403, 429):
             return None, "blocked"
@@ -518,6 +651,9 @@ def _try_fetch(url):
     except requests.exceptions.TooManyRedirects:
         return None, "redirects"
     except Exception:
+        if attempt == 1:
+            time.sleep(WEBSITE_RETRY_DELAY_S)
+            return _try_fetch(url, attempt=2)
         return False, "error"
 
 
@@ -531,7 +667,7 @@ def check_website(url):
     if not url:
         return None, False
 
-    is_archive_url = "web.archive.org" in url or "waybackmachine.org" in url
+    is_archive_url = is_archive_host(url)
 
     if is_archive_url:
         original = _extract_archive_original(url)
@@ -548,76 +684,233 @@ def check_website(url):
     return _try_fetch(url)[0], False
 
 
-def find_wayback_url(url):
+# find_wayback_url() was removed with the Website URL replacement it fed. Picking
+# a snapshot belongs to the curator's dead-link triage, which chooses the one
+# nearest the project's last known activity rather than the newest (the newest is
+# often already a parked-domain page) and rate-limits itself to Wayback's ~15
+# requests/minute. Nothing in this scorer should reintroduce it.
+
+
+class GitHubRateLimited(Exception):
     """
-    Query the Wayback Machine Availability API for the most recent snapshot
-    of a URL. Returns the archive URL string if a status-200 snapshot exists,
-    otherwise None.
+    GitHub refused a call because the rate limit is spent.
+
+    Raised rather than returned so it cannot be mistaken for "this project has
+    no repo". Nothing in the scoring path catches it; main() stops the run,
+    leaving the current record and the rest of the batch unstamped so they come
+    back round on the next run instead of being written up from a failed look.
     """
-    if not url:
+
+    def __init__(self, reset_at=None):
+        self.reset_at = reset_at
+        super().__init__(
+            "GitHub rate limit exhausted"
+            + (f", resets {reset_at:%H:%M:%S} UTC" if reset_at else "")
+        )
+
+
+def _gh_rate_limited(response):
+    """
+    True if this refusal is the rate limiter rather than an ordinary denial.
+
+    A 403 also covers a private or blocked repo, which IS a real absence, so
+    the status code alone is not enough. GitHub marks the primary limit with
+    x-ratelimit-remaining: 0 and a secondary limit with retry-after.
+    """
+    if response.status_code not in (403, 429):
+        return False
+    if response.headers.get("x-ratelimit-remaining") == "0":
+        return True
+    return "retry-after" in response.headers
+
+
+def _gh_limit_reset(response):
+    """When the limit lifts, as a datetime, or None if GitHub didn't say."""
+    reset = response.headers.get("x-ratelimit-reset")
+    if reset:
+        try:
+            return datetime.fromtimestamp(int(reset), timezone.utc)
+        except (ValueError, OverflowError):
+            pass
+    retry = response.headers.get("retry-after")
+    if retry:
+        try:
+            return datetime.now(timezone.utc) + timedelta(seconds=int(retry))
+        except ValueError:
+            pass
+    return None
+
+
+def _gh_get(path, params=None):
+    """
+    GET a GitHub API path; returns parsed JSON, or None when there is genuinely
+    nothing there. Raises GitHubRateLimited when the call was refused over the
+    rate limit, which is a fact about the run and not about the project.
+    """
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    try:
+        r = requests.get(f"https://api.github.com{path}", headers=headers,
+                         params=params or {}, timeout=10)
+    except requests.RequestException:
+        return None
+
+    if r.status_code == 200:
+        try:
+            return r.json()
+        except ValueError:
+            return None
+
+    # A refusal over the rate limit is not an absence of data. Returning None
+    # for both would score the project as having no GitHub activity at all,
+    # write that to Airtable, and exit green: an active project can drop from
+    # 100/Active to 25/Possibly Inactive purely on when the run hit the ceiling.
+    if _gh_rate_limited(r):
+        raise GitHubRateLimited(_gh_limit_reset(r))
+
+    return None
+
+
+FUTURE_GRACE_DAYS = 1
+
+
+def reject_future(dt):
+    """
+    Drop a date more than FUTURE_GRACE_DAYS ahead of now.
+
+    Commit dates, RSS pubDates and social post dates are all set by whoever
+    published them, so any of the three can land in the future through a wrong
+    clock or a deliberate stamp. recency_base_score floors age at 0 days, so a
+    future date would score the maximum forever and would also be written to
+    Airtable as the last activity date. The grace day absorbs clock skew.
+    """
+    if dt is None:
+        return None
+    if (dt - datetime.now(timezone.utc)).days >= FUTURE_GRACE_DAYS:
+        return None
+    return dt
+
+
+def _gh_dt(s):
+    """Parse a GitHub ISO-8601 timestamp into a timezone-aware datetime."""
+    if not s:
         return None
     try:
-        r = requests.get(
-            "https://archive.org/wayback/available",
-            params={"url": url},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return None
-        closest = r.json().get("archived_snapshots", {}).get("closest", {})
-        if closest.get("available") and closest.get("status") == "200":
-            return closest["url"]
-    except Exception:
-        pass
-    return None
+        return reject_future(datetime.fromisoformat(s.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+_GH_MAINTAINER_ROLES = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+
+def _gh_issue_activity(owner, repo):
+    """
+    Most recent *maintainer* activity on issues/PRs, or None.
+    Outsiders filing or commenting on issues doesn't count — a dead repo
+    still accumulates those. Counts only:
+      - merged PRs (merging needs write access)
+      - issues/PRs authored by the owner / org members / collaborators
+      - an outsider's issue closed by someone other than its author
+    """
+    issues = _gh_get(f"/repos/{owner}/{repo}/issues",
+                     {"state": "all", "sort": "updated", "direction": "desc", "per_page": 20})
+    if not issues:
+        return None
+
+    dates = []
+    outsider_closed = []  # closed, outsider-authored: self-closed or maintainer-closed?
+    for it in issues:
+        if (dt := _gh_dt((it.get("pull_request") or {}).get("merged_at"))):
+            dates.append(dt)
+        if it.get("author_association") in _GH_MAINTAINER_ROLES:
+            for key in ("created_at", "closed_at"):
+                if (dt := _gh_dt(it.get(key))):
+                    dates.append(dt)
+        elif (dt := _gh_dt(it.get("closed_at"))):
+            outsider_closed.append((dt, it))
+
+    # Check who closed the most recent outsider-authored issue, but only if
+    # that could improve on what we already have (costs one extra API call).
+    if outsider_closed:
+        dt, it = max(outsider_closed, key=lambda pair: pair[0])
+        if not dates or dt > max(dates):
+            detail = _gh_get(f"/repos/{owner}/{repo}/issues/{it.get('number')}")
+            closed_by = ((detail or {}).get("closed_by") or {}).get("login")
+            author    = (it.get("user") or {}).get("login")
+            if closed_by and closed_by != author:
+                dates.append(dt)
+
+    return max(dates) if dates else None
+
+
+def _check_github_repo(owner, repo):
+    """
+    Gather activity signals for one repo. Returns a dict:
+        best_date – most recent across all signals (or None)
+        archived  – repo is archived (read-only)
+        dates     – {signal: datetime} for push / release / commit / issue_pr
+    or None if the repo can't be fetched.
+    """
+    info = _gh_get(f"/repos/{owner}/{repo}")
+    if info is None:
+        return None
+
+    dates = {}
+    if (dt := _gh_dt(info.get("pushed_at"))):
+        dates["push"] = dt
+
+    rel = _gh_get(f"/repos/{owner}/{repo}/releases/latest")
+    if rel and (dt := _gh_dt(rel.get("published_at"))):
+        dates["release"] = dt
+
+    commits = _gh_get(f"/repos/{owner}/{repo}/commits", {"per_page": 1})
+    if commits:
+        commit_date = (commits[0].get("commit", {}).get("committer") or {}).get("date")
+        if (dt := _gh_dt(commit_date)):
+            dates["commit"] = dt
+
+    # Issue/PR activity, restricted to signals of maintainer involvement
+    if (dt := _gh_issue_activity(owner, repo)):
+        dates["issue_pr"] = dt
+
+    return {
+        "best_date": max(dates.values()) if dates else None,
+        "archived":  bool(info.get("archived")),
+        "dates":     dates,
+    }
 
 
 def check_github(url):
     """
-    Returns pushed_at as a timezone-aware datetime, or None.
-    Handles repo URLs (github.com/org/repo) and org/user profile URLs.
+    GitHub activity signals: pushes, releases, commits, issue/PR activity,
+    and archived status. Handles repo URLs (github.com/org/repo) and org/user
+    profile URLs (checked via their most recently pushed repo).
+    Returns the dict from _check_github_repo, or None.
     """
     if not url:
         return None
 
-    parsed     = urlparse(url)
+    parsed = urlparse(url)
     if "github.com" not in parsed.netloc:
         return None
 
     parts = [p for p in parsed.path.strip("/").split("/") if p]
 
-    headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    if len(parts) >= 2:
+        return _check_github_repo(parts[0], re.sub(r"\.git$", "", parts[1]))
 
-    try:
-        if len(parts) >= 2:
-            owner, repo = parts[0], re.sub(r"\.git$", "", parts[1])
-            r = requests.get(
-                f"https://api.github.com/repos/{owner}/{repo}",
-                headers=headers, timeout=10,
-            )
-            if r.status_code == 200:
-                pushed = r.json().get("pushed_at")
-                if pushed:
-                    return datetime.fromisoformat(pushed.replace("Z", "+00:00"))
-
-        elif len(parts) == 1:
-            owner = parts[0]
-            for entity in ("orgs", "users"):
-                r = requests.get(
-                    f"https://api.github.com/{entity}/{owner}/repos",
-                    headers=headers,
-                    params={"sort": "pushed", "per_page": 1},
-                    timeout=10,
-                )
-                if r.status_code == 200 and r.json():
-                    pushed = r.json()[0].get("pushed_at")
-                    if pushed:
-                        return datetime.fromisoformat(pushed.replace("Z", "+00:00"))
-                    break
-    except Exception:
-        pass
+    if len(parts) == 1:
+        owner = parts[0]
+        for entity in ("orgs", "users"):
+            repos = _gh_get(f"/{entity}/{owner}/repos",
+                            {"sort": "pushed", "per_page": 1})
+            if repos:
+                name = repos[0].get("name")
+                if name:
+                    return _check_github_repo(owner, name)
+                break
 
     return None
 
@@ -1010,20 +1303,28 @@ def compute_liveliness(rec):
         website_alive, is_archived = check_website(raw_url)
         print(f"    website  → alive={website_alive}  archived={is_archived}")
 
-    # ── Wayback Machine fallback for dead sites ───────────────────────────────
-    archive_url = None
-    if website_alive is False and not is_archived and website_url:
-        print(f"    website  → dead, checking Wayback Machine…")
-        archive_url = find_wayback_url(website_url)
-        if archive_url:
-            print(f"    website  → archive found: {archive_url}")
-            is_archived = True  # treat as archived for scoring
-        else:
-            print(f"    website  → no archive found")
+    # A dead site is NOT looked up in the Wayback Machine and its Website URL is
+    # never replaced with a snapshot. Swapping in an archive link is the
+    # graveyard ruling from the dead-link triage codebook, and it is written as
+    # one unit with the Graveyard category and Status: Inactive by a curator who
+    # has first ruled out relink (the project moved and is live elsewhere, which
+    # is the common case). A failed fetch cannot tell relink from graveyard, and
+    # writing one third of the ruling leaves a record in a state the codebook
+    # has no name for: an archive URL, no Graveyard tag, Status still Active.
+    # A snapshot merely existing is also no evidence a project is dead.
+    # is_archived stays set only by check_website, for a Website URL that a
+    # curator already pointed at an archive and whose original no longer answers.
 
     # ── GitHub ───────────────────────────────────────────────────────────────
-    github_date = check_github(fields.get(F_GITHUB))
-    print(f"    github   → last push: {github_date}")
+    gh = check_github(fields.get(F_GITHUB))
+    github_date     = gh["best_date"] if gh else None
+    github_archived = bool(gh and gh["archived"])
+    if gh:
+        detail = "  ".join(f"{k}={v.date()}" for k, v in sorted(gh["dates"].items()))
+        flag   = "ARCHIVED  " if github_archived else ""
+        print(f"    github   → {flag}{detail or 'no dated activity'}")
+    else:
+        print(f"    github   → no data")
     time.sleep(0.3)  # respect GitHub rate limits
 
     # ── Blog feeds ───────────────────────────────────────────────────────────
@@ -1035,7 +1336,7 @@ def compute_liveliness(rec):
             print(f"    blog     → auto-discovered feed: {auto_feed}")
             explicit_feeds = [auto_feed]
     for feed_url in explicit_feeds:
-        d = check_blog_feed(feed_url)
+        d = reject_future(check_blog_feed(feed_url))
         if d and (blog_date is None or d > blog_date):
             blog_date = d
     print(f"    blog     → latest post: {blog_date}")
@@ -1069,6 +1370,7 @@ def compute_liveliness(rec):
         if alive is True:
             accessible_count += 1
         dt, platform = check_social_recency(url)
+        dt = reject_future(dt)
         if dt:
             social_dated.append((dt, platform))
             print(f"    social   → {platform}: last post {dt.date()}")
@@ -1079,12 +1381,21 @@ def compute_liveliness(rec):
     best_score = 0
     best_date  = None  # most recent date found across all sources
 
-    for dt in filter(None, [github_date, blog_date]):
-        s = recency_base_score(dt, now)
+    if github_date:
+        s = recency_base_score(github_date, now)
+        if github_archived:
+            s = min(s, 15)  # maintainers explicitly stopped work on the repo
         if s > best_score:
             best_score = s
-        if best_date is None or dt > best_date:
-            best_date = dt
+        if best_date is None or github_date > best_date:
+            best_date = github_date
+
+    if blog_date:
+        s = recency_base_score(blog_date, now)
+        if s > best_score:
+            best_score = s
+        if best_date is None or blog_date > best_date:
+            best_date = blog_date
 
     for dt, platform in social_dated:
         s = social_recency_score(dt, now)
@@ -1121,8 +1432,6 @@ def compute_liveliness(rec):
     print(f"    → score={score}  activity={activity_status}  status={status or '(no change)'}  last_activity={last_activity_str}")
     if discovered_url:
         print(f"    → discovered homepage: {discovered_url}  (original was article URL)")
-    if archive_url:
-        print(f"    → replacing Website URL with archive: {archive_url}")
 
     return {
         "score":              score,
@@ -1130,7 +1439,6 @@ def compute_liveliness(rec):
         "activity_status":    activity_status,
         "status":             status,
         "discovered_url":     discovered_url,
-        "archive_url":        archive_url,
     }
 
 
@@ -1149,11 +1457,22 @@ def _record_timeout_handler(signum, frame):
     raise RecordTimeout()
 
 def fetch_by_ids(record_ids):
-    """Fetch specific records by ID (for targeted test runs)."""
-    data = at_get(LISTINGS_TABLE, {
-        "recordIds[]": record_ids,
-    })
-    return data.get("records", [])
+    """
+    Fetch specific records by ID (for targeted test runs).
+
+    The list endpoint has no recordIds[] parameter and Airtable ignores query
+    params it does not recognise, so asking that way returns the first page of
+    the table: a run meant for two records scores and writes 100 unrelated
+    listings instead. Fetch them one at a time.
+    """
+    records = []
+    for rid in record_ids:
+        rec = at_get_record(LISTINGS_TABLE, rid)
+        if rec:
+            records.append(rec)
+        else:
+            print(f"  Warning: record {rid} not found, skipping", file=sys.stderr)
+    return records
 
 
 def main():
@@ -1162,6 +1481,16 @@ def main():
     parser.add_argument("--records", nargs="+", metavar="recXXX",
                         help="Specific record IDs to check (skips normal batch queue)")
     args = parser.parse_args()
+
+    # Restore records a curator flagged as wrongly scored, before anything else
+    restored = restore_scored_wrong()
+    if restored:
+        print(f"Restoring {len(restored)} wrongly scored record(s)...")
+        for name, value, stale_score in restored:
+            was = "no score" if stale_score is None else f"scored {stale_score}"
+            print(f"  {name} → {value}, score {EXEMPT_SCORE} "
+                  f"(was {was}; exempt from future checks)")
+        print()
 
     # Mark books/document listings as N/A before the normal timeliness check
     na_records = fetch_na_candidates()
@@ -1183,8 +1512,9 @@ def main():
         return
 
     print(f"Got {len(records)} records.\n")
-    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    updates = []
+    today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    updates      = []
+    rate_limited = False
 
     signal.signal(signal.SIGALRM, _record_timeout_handler)
 
@@ -1196,6 +1526,16 @@ def main():
             name = rec.get("fields", {}).get(F_NAME, rec["id"])
             print(f"\n  [{name}] ✗ exceeded {RECORD_TIME_BUDGET_S}s budget — marking checked without a score")
             result = None
+        except GitHubRateLimited as e:
+            name = rec.get("fields", {}).get(F_NAME, rec["id"])
+            print(f"\n  [{name}] ✗ {e} — stopping the run")
+            print(f"    This record and the {len(records) - records.index(rec) - 1} after it "
+                  f"are left unstamped and stay at the head of the queue.")
+            if not GITHUB_TOKEN:
+                print("    No GITHUB_TOKEN was set, so this run had 60 calls/hour "
+                      "instead of 5000. Export one and rerun.")
+            rate_limited = True
+            break
         finally:
             signal.alarm(0)
 
@@ -1205,8 +1545,6 @@ def main():
             fields[F_ACTIVITY_STATUS] = result["activity_status"]
             if result["last_activity_date"]:
                 fields[F_LAST_ACTIVITY] = result["last_activity_date"]
-            if result.get("archive_url"):
-                fields[F_WEBSITE] = result["archive_url"]
 
         # Write each record as soon as it's done: a stalled or killed run keeps
         # its progress, and Last timeliness check always advances the queue
@@ -1215,22 +1553,20 @@ def main():
 
         update = {"id": rec["id"], "fields": fields}
         update["_discovered_url"] = (result or {}).get("discovered_url")  # stored locally, not sent to Airtable
-        update["_archive_url"]    = (result or {}).get("archive_url")     # stored locally for summary display
         updates.append(update)
         time.sleep(0.5)
 
-    print(f"\n✓ Done — {len(updates)} record(s) written.\n")
+    if rate_limited:
+        print(f"\n✗ Stopped early — {len(updates)} record(s) written before the "
+              f"GitHub rate limit was hit.\n")
+    else:
+        print(f"\n✓ Done — {len(updates)} record(s) written.\n")
     print(f"{'Record ID':<20} {'Score':>7}  {'Activity status':<20}  {'Status':<10}  Last activity")
     print("-" * 80)
     for u in updates:
         f       = u["fields"]
         disc    = u.get("_discovered_url") or ""
-        archive = u.get("_archive_url") or ""
-        suffix  = ""
-        if disc:
-            suffix = f"  → homepage: {disc}"
-        elif archive:
-            suffix = f"  → archived: {archive}"
+        suffix  = f"  → homepage: {disc}" if disc else ""
         print(
             f"{u['id']:<20} "
             f"{str(f.get(F_LIVELINESS, 'n/a')):>7}  "
