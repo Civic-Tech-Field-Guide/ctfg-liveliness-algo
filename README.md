@@ -10,10 +10,12 @@ Airtable.
 `0 9 * * *` cron, and can be triggered by hand from the Actions tab. GitHub delays scheduled
 runs, so the real start time drifts a few hours past 09:00 UTC.
 
-Each run handles `BATCH_SIZE` (10) records and works through the whole table over time. The
-queue is ordered by never-checked records first, oldest-created first within that pool, then
-by oldest `Last timeliness check`. Every record is written to Airtable as soon as it finishes,
-so a run that stalls or gets killed keeps its progress. A record that takes longer than
+Each run handles `BATCH_SIZE` (200) records and works through the whole table over time. At
+that size a daily run clears the 8,700 eligible records that have never been checked in about
+six weeks. The queue is ordered by never-checked records first, oldest-created first within
+that pool, then by oldest `Last timeliness check`. Every record is written to Airtable as
+soon as it finishes, so a run that stalls or gets killed keeps its progress. A record that
+takes longer than
 `RECORD_TIME_BUDGET_S` (120s) is abandoned and stamped as checked so it cannot block the queue.
 
 Secrets used: `AIRTABLE_PAT` (required), `GITHUB_TOKEN` and `YOUTUBE_API_KEY` (optional, both
@@ -23,7 +25,7 @@ If GitHub refuses a call because the rate limit is spent, the run stops instead 
 A refusal is not an absence: scoring through one would write "no code activity" for a project
 that has plenty, and would exit green having done it. The record being checked and the rest of
 the batch are left unstamped, so they stay at the head of the queue for the next run. A repo
-now costs 4 to 6 calls, so a batch of 10 can need 60. With `GITHUB_TOKEN` set the ceiling is
+now costs 4 to 6 calls, so a batch of 200 can need 1,200. With `GITHUB_TOKEN` set the ceiling is
 5000 an hour; without it, 60, which one batch can exhaust on its own.
 
 ## Signals
@@ -148,7 +150,7 @@ export AIRTABLE_PAT=...        # required
 export GITHUB_TOKEN=...        # optional, raises the GitHub rate limit
 export YOUTUBE_API_KEY=...     # optional, enables YouTube post dates
 
-python timeliness_check.py                       # next batch of 10
+python timeliness_check.py                       # next batch of 200
 python timeliness_check.py --records recABC123   # named records only
 ```
 

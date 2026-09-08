@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Timeliness checker for CTFG civic tech project listings.
-Processes BATCH_SIZE projects per run, cycling through all 14k+ records over time.
+Processes BATCH_SIZE projects per run, cycling through all 16k+ records over time.
 
 Usage:
     export AIRTABLE_PAT=your_personal_access_token
@@ -67,7 +67,7 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 BASE_ID       = "appYHxsLYleU2RVYk"
 LISTINGS_TABLE = "tblELFP9tGX07UZDo"
 LINKS_TABLE    = "tblpRr3lPFncgTS8y"
-BATCH_SIZE     = 10
+BATCH_SIZE     = 200
 
 # ── Airtable field IDs — Listings ─────────────────────────────────────────────
 
@@ -246,7 +246,11 @@ def is_excluded(rec):
     return False
 
 
-NEVER_CHECKED_MAX_PAGES = 5  # 500 records; most of this pool is ineligible
+# Pages of 100 to scan per pass before giving up. Roughly 40% of the never-checked
+# pool is eligible, so filling a batch of 200 needs about 500 records scanned; the
+# rest is headroom for a run that lands on a denser patch of ineligible records.
+NEVER_CHECKED_MAX_PAGES = 12
+CHECKED_MAX_PAGES       = 6
 
 
 def fetch_batch():
@@ -283,13 +287,23 @@ def fetch_batch():
 
     # Pass 2: oldest checked (only if the never-checked pool came up short)
     if len(eligible) < BATCH_SIZE:
-        data2 = at_get(LISTINGS_TABLE, {
-            "filterByFormula": f'{{{_field_name(F_LAST_CHECK)}}} != ""',
-            "sort[0][field]": F_LAST_CHECK,
-            "sort[0][direction]": "asc",
-            "pageSize": BATCH_SIZE * 4,
-        })
-        eligible.extend(r for r in data2.get("records", []) if not is_excluded(r))
+        # Airtable caps pageSize at 100 and rejects anything larger, so page
+        # through rather than asking for a batch's worth in one call.
+        offset2 = None
+        for _ in range(CHECKED_MAX_PAGES):
+            params2 = {
+                "filterByFormula": f'{{{_field_name(F_LAST_CHECK)}}} != ""',
+                "sort[0][field]": F_LAST_CHECK,
+                "sort[0][direction]": "asc",
+                "pageSize": 100,
+            }
+            if offset2:
+                params2["offset"] = offset2
+            data2 = at_get(LISTINGS_TABLE, params2)
+            eligible.extend(r for r in data2.get("records", []) if not is_excluded(r))
+            offset2 = data2.get("offset")
+            if len(eligible) >= BATCH_SIZE or not offset2:
+                break
 
     return eligible[:BATCH_SIZE]
 

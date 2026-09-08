@@ -15,7 +15,8 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8       # kill if a run stalls (shouldn't exceed ~5 min for 10 projects)
+    timeout-minutes: 60      # a batch of 200 runs ~25 min at 7s a record; the cap is
+                             # there to kill a stall, not to bound normal work
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
