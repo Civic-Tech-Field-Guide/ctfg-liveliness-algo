@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Timeliness check for a single CTFG listing record."""
 
+import os
+import sys
 import requests
 import re
 import json
@@ -43,24 +45,99 @@ def head_check(url):
     except Exception as e:
         return False, None
 
-def github_pushed_at(github_url):
-    """Return pushed_at date string or None."""
+def gh_api(path, params=None):
+    """GET a GitHub API path; returns parsed JSON or None."""
+    headers = {**HEADERS, "Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = requests.get(f"https://api.github.com{path}", timeout=TIMEOUT,
+                         headers=headers, params=params or {})
+    except Exception:
+        return None
+
+    if r.status_code == 200:
+        try:
+            return r.json()
+        except ValueError:
+            return None
+
+    # Say so out loud. This script exists to explain a score, so reporting a
+    # refused call as "no data" would hide the one fact that explains it.
+    if r.status_code in (403, 429) and (
+            r.headers.get("x-ratelimit-remaining") == "0"
+            or "retry-after" in r.headers):
+        reset = r.headers.get("x-ratelimit-reset", "")
+        when = ""
+        if reset:
+            try:
+                when = " resets " + datetime.fromtimestamp(
+                    int(reset), timezone.utc).strftime("%H:%M:%S UTC")
+            except (ValueError, OverflowError):
+                pass
+        print(f"  ! GitHub rate limit hit on {path}{when} — "
+              f"GitHub signals below are incomplete, not absent.",
+              file=sys.stderr)
+
+    return None
+
+def github_check(github_url):
+    """Return {"archived": bool, "dates": {signal: "YYYY-MM-DD"}} or None."""
     if not github_url:
         return None
     m = re.search(r"github\.com/([^/]+/[^/?\s#]+)", github_url)
     if not m:
         return None
     repo = m.group(1).rstrip("/")
-    try:
-        r = requests.get(f"https://api.github.com/repos/{repo}", timeout=TIMEOUT,
-                         headers={**HEADERS, "Accept": "application/vnd.github.v3+json"})
-        if r.status_code == 200:
-            pushed = r.json().get("pushed_at", "")
-            if pushed:
-                return pushed[:10]
-    except Exception:
-        pass
-    return None
+
+    info = gh_api(f"/repos/{repo}")
+    if info is None:
+        return None
+
+    dates = {}
+    if info.get("pushed_at"):
+        dates["push"] = info["pushed_at"][:10]
+
+    rel = gh_api(f"/repos/{repo}/releases/latest")
+    if rel and rel.get("published_at"):
+        dates["release"] = rel["published_at"][:10]
+
+    commits = gh_api(f"/repos/{repo}/commits", {"per_page": 1})
+    if commits:
+        commit_date = (commits[0].get("commit", {}).get("committer") or {}).get("date")
+        if commit_date:
+            dates["commit"] = commit_date[:10]
+
+    # Issue/PR activity, restricted to signals of maintainer involvement:
+    # merged PRs, maintainer-authored issues/PRs, and closures of an
+    # outsider's issue by someone other than its author. Outsiders merely
+    # filing issues doesn't count — a dead repo still accumulates those.
+    issues = gh_api(f"/repos/{repo}/issues",
+                    {"state": "all", "sort": "updated", "direction": "desc", "per_page": 20})
+    maint_roles = {"OWNER", "MEMBER", "COLLABORATOR"}
+    issue_dates = []
+    outsider_closed = []
+    for it in issues or []:
+        merged = (it.get("pull_request") or {}).get("merged_at")
+        if merged:
+            issue_dates.append(merged)
+        if it.get("author_association") in maint_roles:
+            issue_dates += [d for d in (it.get("created_at"), it.get("closed_at")) if d]
+        elif it.get("closed_at"):
+            outsider_closed.append(it)
+    if outsider_closed:
+        top = max(outsider_closed, key=lambda i: i["closed_at"])
+        if not issue_dates or top["closed_at"] > max(issue_dates):
+            detail = gh_api(f"/repos/{repo}/issues/{top.get('number')}")
+            closed_by = ((detail or {}).get("closed_by") or {}).get("login")
+            author = (top.get("user") or {}).get("login")
+            if closed_by and closed_by != author:
+                issue_dates.append(top["closed_at"])
+    if issue_dates:
+        dates["issue_pr"] = max(issue_dates)[:10]
+
+    return {"archived": bool(info.get("archived")), "dates": dates}
 
 def parse_feed(url):
     """Return latest entry date string or None using basic XML parsing."""
@@ -294,10 +371,14 @@ else:
 # 2. GitHub check
 print("\n2. GitHub check")
 if GITHUB_URL:
-    pushed = github_pushed_at(GITHUB_URL)
-    log("github_pushed_at", pushed)
-    if pushed:
-        all_dates.append(("github_pushed_at", pushed))
+    gh = github_check(GITHUB_URL)
+    if gh:
+        log("github_archived", gh["archived"])
+        for signal_name, d in sorted(gh["dates"].items()):
+            log(f"github_{signal_name}", d)
+            all_dates.append((f"github_{signal_name}", d))
+    else:
+        log("github", "unreachable")
 else:
     log("github", "no URL")
 
