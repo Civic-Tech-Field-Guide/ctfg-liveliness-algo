@@ -50,9 +50,11 @@ year, 55 within two, 35 within three, 15 within five, 5 beyond that. Social date
 brackets capped at 55 and drop to 0 past a year. An archived GitHub repo caps its own
 contribution at 15, since the maintainers said in as many words that they stopped.
 
-The best single date sets the base score, then the website adjusts it: a live site adds 15, a
-dead one subtracts 50, and a listing a curator has already pointed at an archive snapshot,
-whose original URL no longer answers, is capped at 10. Reachable social links add 10 in total,
+The best single date sets the base score, then the website adjusts it: a live site adds 15 when
+the newest dated signal is within a year and 5 when it is older or absent, a dead one subtracts
+50, and a listing a curator has already pointed at an archive snapshot, whose original URL no
+longer answers, is capped at 10. A homepage that loads is evidence of current work only
+alongside something dated and recent, so on its own it earns the reduced bonus. Reachable social links add 10 in total,
 however many there are. A live site with no dated signal at all gets a floor of 25.
 
 A social link counts for reachability only, and that is capped at 10 per listing because a page
@@ -129,6 +131,16 @@ Restoring 1 wrongly scored record(s)...
 ```
 
 ## Running it locally
+
+`feedparser` is required, not optional. Without it every blog check returns nothing, so a
+project that posts weekly is scored as having no blog and that verdict is written to Airtable.
+The script refuses to start rather than scoring around a missing checker. On a PEP 668 system
+Python it will not install globally, so use a venv:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python timeliness_check.py
+```
 
 ```sh
 pip install -r requirements.txt
