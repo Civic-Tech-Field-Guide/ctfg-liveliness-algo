@@ -1210,6 +1210,15 @@ def check_social_recency(url):
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
+# A social page that loads says nothing about whether anything was posted to it,
+# so reachability is weak evidence and is capped to a nudge. At 10 points per
+# link up to three it was worth +30, enough to carry a listing with no dated
+# signal anywhere past a threshold: a live homepage and three loading social
+# pages scored 45 and read Likely Active on nothing but pages existing. Posting
+# recency is scored separately by social_recency_score(), which is unaffected.
+SOCIAL_REACHABLE_BONUS_MAX = 10
+
+
 def recency_base_score(dt, now):
     """
     Score 0–85 for GitHub / blog signals based on recency.
@@ -1415,7 +1424,7 @@ def compute_liveliness(rec):
         score = max(score - 50, 0)  # strong signal of death
 
     # Social presence bonus: +10 per accessible link, up to 3 links (+30 max)
-    score = min(score + accessible_count * 10, 100)
+    score = min(score + min(accessible_count * 10, SOCIAL_REACHABLE_BONUS_MAX), 100)
 
     # Floor: website up but no dated signals → benefit of the doubt
     if best_date is None and website_alive is True and not is_archived:

@@ -52,8 +52,13 @@ contribution at 15, since the maintainers said in as many words that they stoppe
 
 The best single date sets the base score, then the website adjusts it: a live site adds 15, a
 dead one subtracts 50, and a listing a curator has already pointed at an archive snapshot,
-whose original URL no longer answers, is capped at 10. Each reachable social link adds 10, up
-to three links. A live site with no dated signal at all gets a floor of 25.
+whose original URL no longer answers, is capped at 10. Reachable social links add 10 in total,
+however many there are. A live site with no dated signal at all gets a floor of 25.
+
+A social link counts for reachability only, and that is capped at 10 per listing because a page
+that loads says nothing about whether anything was posted to it. Posting recency is scored
+separately and is worth up to 55. Before the cap, three loading social pages were worth 30,
+enough to lift a listing with no dated signal anywhere to 45 and report it as Likely Active.
 
 | Score | Activity status |
 | --- | --- |
