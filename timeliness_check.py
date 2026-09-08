@@ -38,13 +38,22 @@ from urllib.parse import urlparse, parse_qs
 
 import requests
 
+# Hard requirement, not an optional extra. Without feedparser every blog check
+# returns None, so a project that posts weekly is scored as if it has no blog at
+# all and that verdict is written to Airtable. A missing checker is a fact about
+# the run, never a fact about the project, so refuse to run rather than warn and
+# score anyway. Pinned in requirements.txt.
 try:
     import feedparser
-    HAS_FEEDPARSER = True
 except ImportError:
-    HAS_FEEDPARSER = False
-    print("Warning: feedparser not installed — blog feed checks disabled.", file=sys.stderr)
-    print("Install with: pip install feedparser", file=sys.stderr)
+    sys.exit(
+        "Error: feedparser is not installed, so blog feed checks would silently\n"
+        "return nothing and every feed-only project would be scored as inactive.\n"
+        "Install it with: pip install -r requirements.txt\n"
+        "On a PEP 668 system Python, use a venv:\n"
+        "  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt\n"
+        "  .venv/bin/python timeliness_check.py"
+    )
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -973,17 +982,16 @@ def discover_feed_url(website_url):
     # Step 3: feedparser fallback for /feed and /rss — handles platforms like
     # Substack where the page is JS-rendered (no autodiscovery link) and the
     # feed endpoint may not return an XML content-type header.
-    if HAS_FEEDPARSER:
-        for path in ("/feed", "/rss"):
-            try:
-                url = base + path
-                r   = get_limited(url, timeout=8)
-                if r.status_code == 200:
-                    feed = feedparser.parse(r.content)
-                    if feed.entries:
-                        return url
-            except Exception:
-                continue
+    for path in ("/feed", "/rss"):
+        try:
+            url = base + path
+            r   = get_limited(url, timeout=8)
+            if r.status_code == 200:
+                feed = feedparser.parse(r.content)
+                if feed.entries:
+                    return url
+        except Exception:
+            continue
 
     return None
 
@@ -1037,8 +1045,6 @@ def fetch_links_for_record(linked_ids):
 
 def _parse_feed_latest(url, extra_headers=None):
     """Fetch a feed URL and return the most recent entry datetime, or None."""
-    if not HAS_FEEDPARSER:
-        return None
     try:
         headers = dict(extra_headers) if extra_headers else None
         r = get_limited(url, headers=headers)
@@ -1217,6 +1223,24 @@ def check_social_recency(url):
 # pages scored 45 and read Likely Active on nothing but pages existing. Posting
 # recency is scored separately by social_recency_score(), which is unaffected.
 SOCIAL_REACHABLE_BONUS_MAX = 10
+
+# A live homepage is only evidence of current work alongside something dated and
+# recent. A site that loads while the newest signal is over a year old earns the
+# reduced bonus: enough to keep the listing off the dead-site penalty, not enough
+# to carry stale work upward. Abre Alcaldias read 100/Active off a 698-day-old
+# blog post plus a live site, because 55 + 15 lands exactly on the Active line.
+WEBSITE_ALIVE_BONUS       = 15
+WEBSITE_ALIVE_BONUS_STALE = 5
+WEBSITE_BONUS_FRESH_DAYS  = 365
+
+
+def website_alive_bonus(best_date, now):
+    """Points a reachable website earns, given the newest dated signal."""
+    if best_date is None:
+        return WEBSITE_ALIVE_BONUS_STALE
+    if (now - best_date).days <= WEBSITE_BONUS_FRESH_DAYS:
+        return WEBSITE_ALIVE_BONUS
+    return WEBSITE_ALIVE_BONUS_STALE
 
 
 def recency_base_score(dt, now):
@@ -1419,7 +1443,7 @@ def compute_liveliness(rec):
     if is_archived:
         score = min(score, 10)      # almost certainly dead if pointing to web archive
     elif website_alive is True:
-        score = min(score + 15, 100)
+        score = min(score + website_alive_bonus(best_date, now), 100)
     elif website_alive is False:
         score = max(score - 50, 0)  # strong signal of death
 
