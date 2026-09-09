@@ -842,32 +842,67 @@ def _gh_dt(s):
 
 _GH_MAINTAINER_ROLES = {"OWNER", "MEMBER", "COLLABORATOR"}
 
+# How far back the issue/PR resolution rate is read. The rate has to be
+# time-boxed to say anything about now: an all-time closed-to-open ratio never
+# decays, so a repo that closed 900 issues between 2015 and 2020 and nothing
+# since still scores as well maintained. Six months is long enough that a
+# volunteer project going quiet for a summer is not read as abandoned.
+ISSUE_RESOLUTION_WINDOW_DAYS = 180
+
+# Below this many items touched inside the window there is not enough tracker
+# traffic to read either way, and no adjustment is made. A live two-person
+# project with three issues a year would otherwise be marked unattended for
+# having nothing to close.
+ISSUE_RESOLUTION_MIN_SAMPLE = 5
+
 
 def _gh_issue_activity(owner, repo):
     """
-    Most recent *maintainer* activity on issues/PRs, or None.
+    Returns (best_date, resolution).
+
+    best_date is the most recent *maintainer* activity on issues/PRs, or None.
     Outsiders filing or commenting on issues doesn't count — a dead repo
     still accumulates those. Counts only:
       - merged PRs (merging needs write access)
       - issues/PRs authored by the owner / org members / collaborators
       - an outsider's issue closed by someone other than its author
+
+    resolution is {"touched": n, "resolved": n} over the items updated inside
+    ISSUE_RESOLUTION_WINDOW_DAYS, or None when the sample is too small to read.
+    It answers a different question from best_date: not when the tracker was
+    last touched, but whether what came in is being dealt with.
+
+    Both come out of the same request, so the resolution rate costs no calls.
     """
     issues = _gh_get(f"/repos/{owner}/{repo}/issues",
                      {"state": "all", "sort": "updated", "direction": "desc", "per_page": 20})
     if not issues:
-        return None
+        return None, None
+
+    window_start = datetime.now(timezone.utc) - timedelta(days=ISSUE_RESOLUTION_WINDOW_DAYS)
+    touched = resolved = 0
 
     dates = []
     outsider_closed = []  # closed, outsider-authored: self-closed or maintainer-closed?
     for it in issues:
-        if (dt := _gh_dt((it.get("pull_request") or {}).get("merged_at"))):
-            dates.append(dt)
+        merged_at = _gh_dt((it.get("pull_request") or {}).get("merged_at"))
+        closed_at = _gh_dt(it.get("closed_at"))
+
+        # Resolution rate, over the items the window can actually speak about.
+        if (upd := _gh_dt(it.get("updated_at"))) and upd >= window_start:
+            touched += 1
+            ended = merged_at or closed_at
+            if ended and ended >= window_start:
+                resolved += 1
+
+        if merged_at:
+            dates.append(merged_at)
         if it.get("author_association") in _GH_MAINTAINER_ROLES:
             for key in ("created_at", "closed_at"):
                 if (dt := _gh_dt(it.get(key))):
                     dates.append(dt)
-        elif (dt := _gh_dt(it.get("closed_at"))):
-            outsider_closed.append((dt, it))
+        elif closed_at:
+            outsider_closed.append((closed_at, it))
 
     # Check who closed the most recent outsider-authored issue, but only if
     # that could improve on what we already have (costs one extra API call).
@@ -880,15 +915,18 @@ def _gh_issue_activity(owner, repo):
             if closed_by and closed_by != author:
                 dates.append(dt)
 
-    return max(dates) if dates else None
+    resolution = ({"touched": touched, "resolved": resolved}
+                  if touched >= ISSUE_RESOLUTION_MIN_SAMPLE else None)
+    return (max(dates) if dates else None), resolution
 
 
 def _check_github_repo(owner, repo):
     """
     Gather activity signals for one repo. Returns a dict:
-        best_date – most recent across all signals (or None)
-        archived  – repo is archived (read-only)
-        dates     – {signal: datetime} for push / release / commit / issue_pr
+        best_date  – most recent across all signals (or None)
+        archived   – repo is archived (read-only)
+        dates      – {signal: datetime} for push / release / commit / issue_pr
+        resolution – recent issue/PR resolution counts, or None
     or None if the repo can't be fetched.
     """
     info = _gh_get(f"/repos/{owner}/{repo}")
@@ -910,13 +948,15 @@ def _check_github_repo(owner, repo):
             dates["commit"] = dt
 
     # Issue/PR activity, restricted to signals of maintainer involvement
-    if (dt := _gh_issue_activity(owner, repo)):
-        dates["issue_pr"] = dt
+    issue_date, resolution = _gh_issue_activity(owner, repo)
+    if issue_date:
+        dates["issue_pr"] = issue_date
 
     return {
-        "best_date": max(dates.values()) if dates else None,
-        "archived":  bool(info.get("archived")),
-        "dates":     dates,
+        "best_date":  max(dates.values()) if dates else None,
+        "archived":   bool(info.get("archived")),
+        "dates":      dates,
+        "resolution": resolution,
     }
 
 
@@ -1263,6 +1303,48 @@ WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
 
 
+# Whether the issue tracker is being worked, as a tiebreaker on the dated
+# signals rather than a score of its own. Worth 5 points and no more, for two
+# reasons: it correlates with the issue_pr date that may already have set the
+# base score, and it can be inflated without anyone meaning to, by a stale bot
+# closing everything untouched for 60 days. Telling a bot's closure from a
+# maintainer's costs one API call per issue, which a 200-record batch cannot
+# afford, so that false positive is priced in at 5 points instead of chased.
+ISSUE_RESOLUTION_BONUS      = 5
+ISSUE_RESOLUTION_PENALTY    = 5
+ISSUE_RESOLUTION_GOOD_RATIO = 0.5
+
+
+def issue_resolution_adjustment(resolution):
+    """
+    Points for how much of the recent issue/PR traffic got resolved, as
+    (points, label for the breakdown), for _adjustment() to render. (0, None)
+    when there is nothing worth saying: too small a sample, or a middling rate.
+
+    Only a tracker with traffic and nothing closed is penalised. A backlog of
+    old issues left open is not evidence of anything on its own, since a
+    maintained project that triages carefully carries one and a project that
+    runs a stale bot does not.
+    """
+    if not resolution:
+        return 0, None
+
+    touched, resolved = resolution["touched"], resolution["resolved"]
+    window = f"{ISSUE_RESOLUTION_WINDOW_DAYS // 30} months"
+
+    if resolved == 0:
+        return -ISSUE_RESOLUTION_PENALTY, (
+            f"None of the {touched} issues and pull requests active in the last "
+            f"{window} were closed")
+
+    if resolved / touched >= ISSUE_RESOLUTION_GOOD_RATIO:
+        return ISSUE_RESOLUTION_BONUS, (
+            f"{resolved} of the {touched} issues and pull requests active in the "
+            f"last {window} were closed or merged")
+
+    return 0, None
+
+
 # Wording for the public score breakdown. The scorer keeps GitHub sub-signals
 # apart because they mean different things to a reader: a release is a decision
 # to ship, a push is only that somebody touched the repo.
@@ -1421,6 +1503,8 @@ def compute_liveliness(rec):
     if gh:
         detail = "  ".join(f"{k}={v.date()}" for k, v in sorted(gh["dates"].items()))
         flag   = "ARCHIVED  " if github_archived else ""
+        if (res := gh.get("resolution")):
+            detail += f"  resolved={res['resolved']}/{res['touched']}"
         print(f"    github   → {flag}{detail or 'no dated activity'}")
     else:
         print(f"    github   → no data")
@@ -1522,6 +1606,17 @@ def compute_liveliness(rec):
                        "activity is, it counts for at most 15")
     else:
         why.append("No dated activity found in code, feeds or social posts (0)")
+
+    # Issue tracker responsiveness. A tiebreaker on the dated signals above,
+    # never a base score, so it is applied after the winner is chosen. Skipped
+    # for an archived repo: nothing can be closed in one, and the archive cap
+    # has already said what needs saying.
+    if gh and not github_archived:
+        resolution_adj, resolution_label = issue_resolution_adjustment(gh.get("resolution"))
+        if resolution_label:
+            before = score
+            score  = max(0.0, min(score + resolution_adj, 100))
+            why.append(_adjustment(resolution_label, resolution_adj, score - before))
 
     # Website modifiers
     if is_archived:

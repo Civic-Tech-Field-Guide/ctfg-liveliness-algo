@@ -33,13 +33,25 @@ now costs 4 to 6 calls, so a batch of 200 can need 1,200. With `GITHUB_TOKEN` se
 | Source | What is checked |
 | --- | --- |
 | Website | Responds at all. 403 and 429 count as indeterminate, not dead, because they are usually bot blocking. A hard connection error is retried once before the site is called dead. An article URL is followed to find the project homepage. If the Website URL already points at an archive snapshot, the original URL is extracted and tried first, and the listing counts as live if the original answers. Liveness is judged by where a fetch lands, not by the status code alone: a domain whose owner has pointed it at a snapshot of itself answers 200 from an archive host, and does not count as live. |
-| GitHub | Last push, latest release, last commit, maintainer activity on issues and PRs, and whether the repo is archived. A profile URL is resolved to that account's most recently pushed repo. |
+| GitHub | Last push, latest release, last commit, maintainer activity on issues and PRs, how much of the recent issue traffic got resolved, and whether the repo is archived. A profile URL is resolved to that account's most recently pushed repo. |
 | Blog | Latest entry in an RSS or Atom feed, either from the Airtable field or discovered on the homepage. |
 | Social | Last post date for YouTube, Bluesky, Medium, Reddit, Substack and Mastodon. Twitter/X, LinkedIn, Facebook and Instagram are checked for reachability only, since neither exposes a post date. Links come from the Airtable Links table and from scraping the homepage. |
 
 Maintainer activity on issues counts merged PRs, anything opened by an owner, member or
 collaborator, and an outsider's issue closed by somebody other than its author. An outsider
 merely filing an issue does not count, because a dead repo keeps collecting those.
+
+The resolution rate answers a different question from that date: not when the tracker was last
+touched, but whether what came in is being dealt with. Of the 20 most recently updated issues
+and PRs, it counts the ones updated in the last 180 days and how many of those were closed or
+merged inside the same window. It is read from the request the issue dates already need, so it
+costs no extra API calls. Below 5 items in the window there is too little traffic to read and
+nothing is applied, which keeps a live two-person project with three issues a year from being
+marked unattended for having nothing to close.
+
+The window matters. An all-time ratio of closed to open issues never decays, so a repo that
+closed 900 issues between 2015 and 2020 and nothing since still reads as well maintained, which
+is the opposite of what this tool is for.
 
 Any date more than a day in the future is discarded. Commit dates, RSS pubDates and social
 post dates are all set by whoever published them, so a wrong clock or a deliberate stamp can
@@ -58,6 +70,15 @@ the newest dated signal is within a year and 5 when it is older or absent, a dea
 longer answers, is capped at 10. A homepage that loads is evidence of current work only
 alongside something dated and recent, so on its own it earns the reduced bonus. Reachable social links add 10 in total,
 however many there are. A live site with no dated signal at all gets a floor of 25.
+
+The issue tracker adjusts the score by 5 either way, and only at the ends of the range: closing
+or merging at least half of the recent traffic adds 5, and closing none of it subtracts 5. A
+backlog of old issues left open on its own is worth nothing in either direction, since a project
+that triages carefully carries one and a project running a stale bot does not. The adjustment is
+small because it overlaps the issue and PR date that may already have set the base score, and
+because a stale bot closing everything untouched for 60 days inflates it. Telling a bot's
+closure from a maintainer's costs one API call per issue, which a 200-record batch cannot
+afford. An archived repo is skipped: nothing can be closed in one.
 
 A social link counts for reachability only, and that is capped at 10 per listing because a page
 that loads says nothing about whether anything was posted to it. Posting recency is scored
@@ -84,6 +105,7 @@ score, lists the dated signals that lost to it, and gives each adjustment with i
 ```
 Strongest signal: GitHub push, 8 months ago (70)
 Also found: Bluesky post 30 days ago (55)
+11 of the 20 issues and pull requests active in the last 6 months were closed or merged (+5)
 Website is responding (+15)
 1 social account reachable (+10)
 Total: 100 out of 100 - Active
