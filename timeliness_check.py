@@ -95,6 +95,7 @@ F_ACTIVITY_STATUS = "fld8cGHyyU0CffP2s"  # Activity status — full scale (creat
 F_LIVELINESS      = "fldbzhgtmZEjH7yaK"  # Liveliness score (created 2026-04-01)
 F_LAST_ACTIVITY   = "fldeRTiBRsmhQJhxx"  # Last activity date (created 2026-04-01)
 F_LAST_CHECK      = "fld8pjefvIqtFYxxO"  # Last timeliness check (created 2026-04-01)
+F_BREAKDOWN       = "fldf1lqGIoBc7qMWF"  # Score breakdown (created 2026-09-08)
 
 # Human correction of a wrong verdict. Curator sets Activity status to
 # AS_SCORED_WRONG; the next run restores the record's own Status value and
@@ -102,6 +103,19 @@ F_LAST_CHECK      = "fld8pjefvIqtFYxxO"  # Last timeliness check (created 2026-0
 F_FALSE_INACTIVE  = "fldaMAxokw1rgdwO5"  # False inactive (checkbox)
 AS_SCORED_WRONG   = "Claude scored wrong"
 EXEMPT_SCORE      = 100  # score written to an exempted record
+
+# What the public breakdown says once a curator has overruled the algorithm.
+# It replaces the reasoning from the run that got it wrong, which would
+# otherwise sit in Airtable forever: the False inactive checkbox stops the
+# record ever being scored again, so nothing would come along to correct it.
+CURATOR_BREAKDOWN = {
+    "Active":   "A Field Guide curator reviewed this listing and confirmed the "
+                "project is still going, so it is no longer scored automatically.",
+    "Inactive": "A Field Guide curator reviewed this listing and recorded the "
+                "project as inactive, so it is no longer scored automatically.",
+    "blank":    "A Field Guide curator reviewed this listing, so it is no longer "
+                "scored automatically.",
+}
 
 # ── Airtable field IDs — Links table ─────────────────────────────────────────
 
@@ -352,6 +366,7 @@ def restore_scored_wrong():
                 F_ACTIVITY_STATUS: restore,
                 F_FALSE_INACTIVE:  True,
                 F_LIVELINESS:      EXEMPT_SCORE,
+                F_BREAKDOWN:       CURATOR_BREAKDOWN[restore or "blank"],
             },
         })
         restored.append((
@@ -1248,6 +1263,43 @@ WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
 
 
+# Wording for the public score breakdown. The scorer keeps GitHub sub-signals
+# apart because they mean different things to a reader: a release is a decision
+# to ship, a push is only that somebody touched the repo.
+GH_SIGNAL_LABELS = {
+    "push":     "GitHub push",
+    "release":  "GitHub release",
+    "commit":   "GitHub commit",
+    "issue_pr": "GitHub issue and pull request activity",
+}
+
+
+def describe_age(dt, now):
+    """Age of a signal in words, for the breakdown shown on the profile page."""
+    days = max(0, (now - dt).days)
+    if days == 0:  return "today"
+    if days == 1:  return "yesterday"
+    if days < 60:  return f"{days} days ago"
+    if days < 365: return f"{min(11, round(days / 30.44))} months ago"
+    years = max(1, round(days / 365.25))
+    return f"{years} year{'' if years == 1 else 's'} ago"
+
+
+def _adjustment(label, nominal, applied):
+    """
+    One breakdown line, reporting the points actually applied rather than the
+    points the rule nominally offers. The two differ whenever the 100 ceiling or
+    the 0 floor bites, and a public breakdown whose figures do not add up to its
+    own total is worse than no breakdown at all.
+    """
+    if applied == nominal:
+        return f"{label} ({applied:+g})"
+    limit = "above 100" if nominal > 0 else "below 0"
+    if applied == 0:
+        return f"{label} (no change, the score cannot go {limit})"
+    return f"{label} ({applied:+g}, because the score cannot go {limit})"
+
+
 def website_alive_bonus(best_date, now):
     """Points a reachable website earns, given the newest dated signal."""
     if best_date is None:
@@ -1422,50 +1474,99 @@ def compute_liveliness(rec):
             social_dated.append((dt, platform))
             print(f"    social   → {platform}: last post {dt.date()}")
 
-    accessible_count = min(accessible_count, 3)  # cap alive bonus at 3 links
+    # No cap on the count here: SOCIAL_REACHABLE_BONUS_MAX already caps what
+    # reachability is worth, so capping the count too changed no score and only
+    # made the breakdown under-report how many accounts were actually reached.
 
     # ── Combine all signals ───────────────────────────────────────────────────
-    best_score = 0
-    best_date  = None  # most recent date found across all sources
+    # Every dated signal becomes a (points, date, label) candidate. The score is
+    # the single best of these and never their sum, which is exactly the part a
+    # reader cannot infer from the final number, so the breakdown has to name
+    # which signal won and show the others as also-rans.
+    candidates = []
 
     if github_date:
         s = recency_base_score(github_date, now)
         if github_archived:
             s = min(s, 15)  # maintainers explicitly stopped work on the repo
-        if s > best_score:
-            best_score = s
-        if best_date is None or github_date > best_date:
-            best_date = github_date
+        kind = next((k for k, v in gh["dates"].items() if v == github_date), None)
+        candidates.append((s, github_date, GH_SIGNAL_LABELS.get(kind, "GitHub activity")))
 
     if blog_date:
-        s = recency_base_score(blog_date, now)
-        if s > best_score:
-            best_score = s
-        if best_date is None or blog_date > best_date:
-            best_date = blog_date
+        candidates.append((recency_base_score(blog_date, now), blog_date, "Blog post"))
 
     for dt, platform in social_dated:
-        s = social_recency_score(dt, now)
-        if s > best_score:
-            best_score = s
-        if best_date is None or dt > best_date:
-            best_date = dt
+        candidates.append((social_recency_score(dt, now), dt, f"{platform} post"))
+
+    best_score = max((c[0] for c in candidates), default=0)
+    best_date  = max((c[1] for c in candidates), default=None)
 
     score = float(best_score)
+
+    # The public explanation, written to Airtable and shown on the profile page.
+    # Built alongside the arithmetic rather than reconstructed afterwards: a 70
+    # could be a 300-day-old commit or social posting plus a live site, and the
+    # score on its own cannot tell those apart.
+    why = []
+
+    if candidates:
+        winner = max(candidates, key=lambda c: (c[0], c[1]))
+        why.append(f"Strongest signal: {winner[2]}, {describe_age(winner[1], now)} ({winner[0]})")
+        others = sorted((c for c in candidates if c is not winner),
+                        key=lambda c: c[0], reverse=True)
+        if others:
+            why.append("Also found: " + ", ".join(
+                f"{c[2]} {describe_age(c[1], now)} ({c[0]})" for c in others))
+        if github_archived:
+            why.append("The GitHub repository is archived, so however recent its last "
+                       "activity is, it counts for at most 15")
+    else:
+        why.append("No dated activity found in code, feeds or social posts (0)")
 
     # Website modifiers
     if is_archived:
         score = min(score, 10)      # almost certainly dead if pointing to web archive
+        why.append("The listed address is an archive snapshot and the original no "
+                   "longer answers (score capped at 10)")
     elif website_alive is True:
-        score = min(score + website_alive_bonus(best_date, now), 100)
+        bonus  = website_alive_bonus(best_date, now)
+        before = score
+        score  = min(score + bonus, 100)
+        why.append(_adjustment(
+            "Website is responding" if bonus == WEBSITE_ALIVE_BONUS
+            else "Website is responding, but nothing dated and recent was found to go "
+                 "with it",
+            bonus, score - before))
     elif website_alive is False:
-        score = max(score - 50, 0)  # strong signal of death
+        before = score
+        score  = max(score - 50, 0)  # strong signal of death
+        why.append(_adjustment("Website did not respond", -50, score - before))
+    elif url_class == "article":
+        why.append("The listed address is an article about the project rather than the "
+                   "project itself, and no homepage could be found from it")
+    elif not raw_url:
+        why.append("No website address on this listing to check")
+    elif url_class == "skip":
+        why.append("The listed address is not one that can be checked")
+    else:
+        why.append("Website could not be checked: it timed out or refused the request")
 
-    # Social presence bonus: +10 per accessible link, up to 3 links (+30 max)
-    score = min(score + min(accessible_count * 10, SOCIAL_REACHABLE_BONUS_MAX), 100)
+    # Social presence bonus, capped: a page that loads says nothing about whether
+    # anything was ever posted to it.
+    social_bonus = min(accessible_count * 10, SOCIAL_REACHABLE_BONUS_MAX)
+    before = score
+    score  = min(score + social_bonus, 100)
+    if social_bonus:
+        why.append(_adjustment(
+            f"{accessible_count} social account"
+            f"{'' if accessible_count == 1 else 's'} reachable",
+            social_bonus, score - before))
 
     # Floor: website up but no dated signals → benefit of the doubt
     if best_date is None and website_alive is True and not is_archived:
+        if score < 25:
+            why.append("Nothing dated to go on, but the site is up, so the score is "
+                       "given the benefit of the doubt (floor 25)")
         score = max(score, 25)
 
     # Fully unknown: nothing could be checked at all
@@ -1474,6 +1575,16 @@ def compute_liveliness(rec):
     score  = round(score, 1)
     activity_status = "Unknown" if no_signals else score_to_activity_status(score)
     status          = None      if no_signals else score_to_status(score)
+
+    if no_signals and is_archived:
+        why = ["The address on this listing is an archive snapshot, and the original "
+               "could not be reached to see whether the project is still there."]
+    elif no_signals:
+        why = ["Nothing on this listing could be checked: no working website address, "
+               "no code repository, no feed and no reachable social accounts."]
+    else:
+        why.append(f"Total: {score:g} out of 100 - {activity_status}")
+    breakdown = "\n".join(why)
 
     last_activity_str = best_date.strftime("%Y-%m-%d") if best_date else None
     print(f"    → score={score}  activity={activity_status}  status={status or '(no change)'}  last_activity={last_activity_str}")
@@ -1485,6 +1596,7 @@ def compute_liveliness(rec):
         "last_activity_date": last_activity_str,
         "activity_status":    activity_status,
         "status":             status,
+        "breakdown":          breakdown,
         "discovered_url":     discovered_url,
     }
 
@@ -1590,8 +1702,15 @@ def main():
         if result:
             fields[F_LIVELINESS]      = result["score"]
             fields[F_ACTIVITY_STATUS] = result["activity_status"]
+            fields[F_BREAKDOWN]       = result["breakdown"]
             if result["last_activity_date"]:
                 fields[F_LAST_ACTIVITY] = result["last_activity_date"]
+        else:
+            # Timed out. Last timeliness check still advances so the record
+            # cannot block the queue, which leaves the profile page saying it
+            # was checked today. The old reasons were not among what was
+            # checked today, so they go rather than stand under that date.
+            fields[F_BREAKDOWN] = ""
 
         # Write each record as soon as it's done: a stalled or killed run keeps
         # its progress, and Last timeliness check always advances the queue

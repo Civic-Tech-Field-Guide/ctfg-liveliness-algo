@@ -74,8 +74,30 @@ enough to lift a listing with no dated signal anywhere to 45 and report it as Li
 
 ## What gets written to Airtable
 
-`Liveliness score`, `Activity status`, `Last activity date` and `Last timeliness check`. That
-is the whole list.
+`Liveliness score`, `Activity status`, `Last activity date`, `Last timeliness check` and
+`Score breakdown`. That is the whole list.
+
+`Score breakdown` is a plain-text account of how the score was reached, written on every run
+and shown to the public on the project's profile page. It names the signal that set the base
+score, lists the dated signals that lost to it, and gives each adjustment with its points:
+
+```
+Strongest signal: GitHub push, 8 months ago (70)
+Also found: Bluesky post 30 days ago (55)
+Website is responding (+15)
+1 social account reachable (+10)
+Total: 100 out of 100 - Active
+```
+
+It is built as the score is calculated rather than reconstructed from the final number, which
+cannot be done: 70 is a 300-day-old commit on one listing and social posting plus a live site
+on another.
+
+Each line carries the points actually applied rather than the points the rule nominally
+offers, so the figures always add up to the total. The two differ when the 100 ceiling or the
+0 floor bites, and the line says so: a listing already on 100 reads `no change, the score
+cannot go above 100` against its social accounts, and a 35-point listing whose website is down
+loses `-35, because the score cannot go below 0` rather than the full 50.
 
 The `Status` field (Active / Inactive / N/A) stays under human control and is never written by
 the scoring pass. The one exception is that books and documents are marked `N/A` at the start
@@ -104,6 +126,19 @@ is not a graveyard ruling. Triage lives with the curator tooling.
 A record is passed over if `Status` is already Inactive or N/A, if it has no categories
 assigned, if its category is graveyard, if it is a document or a book, if it launched this year
 and is flagged as a new launch, or if it has been marked exempt by a curator.
+
+## The profile page widget
+
+`liveliness-embed-snippet.html` is the meter shown on each project's profile page: a gradient
+strip from grey to green with a marker at the score, the last activity date, the breakdown
+above, and the date of the last check. It is a single self-contained file pasted into a Softr
+custom-code block, and this repo holds the source of truth for it. See the comment at the top
+of the file for what the Softr block has to expose.
+
+Two states it deliberately does not present as an ordinary score. A record with **False
+inactive** ticked sits at 100 because a curator overruled the algorithm, not because it earned
+it, so the widget says so instead of drawing a full bar. A record with no score at all renders
+nothing rather than an empty meter.
 
 ## Correcting a wrong verdict
 
