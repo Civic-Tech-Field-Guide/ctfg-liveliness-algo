@@ -37,7 +37,14 @@ def fetch_ids(pat, score):
     """Every record id whose Liveliness score is exactly `score`."""
     ids, offset = [], None
     while True:
-        params = [("filterByFormula", "{Liveliness score} = %s" % score),
+        # The same gates fetch_batch() applies. --records bypasses is_excluded()
+        # by design, so that a curator can force a re-check of one listing; run
+        # in bulk without this filter it re-scores records the daily queue is
+        # deliberately leaving alone and overwrites their Activity status.
+        formula = ('AND({Liveliness score} = %s,'
+                   ' {Status} != "Inactive", {Status} != "N/A",'
+                   ' NOT({False inactive}))' % score)
+        params = [("filterByFormula", formula),
                   ("pageSize", "100"),
                   ("fields[]", "Project name")]
         if offset:
