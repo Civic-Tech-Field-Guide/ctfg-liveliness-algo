@@ -79,12 +79,12 @@ def main():
 
     print("fetching listings scored %g ..." % args.score)
     found = fetch_ids(pat, args.score)
-    todo = [(rid, name) for rid, name in found if rid not in done]
-    if args.limit:
-        todo = todo[:args.limit]
+    remaining = [(rid, name) for rid, name in found if rid not in done]
+    todo = remaining[:args.limit] if args.limit else remaining
 
-    print("scored %g: %d   already done: %d   to do now: %d\n"
-          % (args.score, len(found), len(found) - len(todo), len(todo)))
+    print("scored %g: %d   already done: %d   still to do: %d   this run: %d\n"
+          % (args.score, len(found), len(found) - len(remaining),
+             len(remaining), len(todo)))
 
     if args.dry_run:
         for rid, name in todo[:40]:
