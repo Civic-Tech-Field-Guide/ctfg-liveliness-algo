@@ -14,6 +14,8 @@ rather than re-checking everything.
     AIRTABLE_PAT=...  GITHUB_TOKEN=$(gh auth token)  python3 backfill_floored.py
 
     --score N      which score to sweep (default 25)
+    --redo-state   re-run the ids already in the state file and clear it, for
+                   when the scorer changed after they were processed
     --chunk N      ids per timeliness_check invocation (default 25)
     --limit N      stop after N records, for a small trial run
     --dry-run      list what would be re-scored and exit without writing
@@ -61,9 +63,30 @@ def fetch_ids(pat, score):
             return ids
 
 
+def scoreable(pat, ids):
+    """Of these ids, the ones the daily queue would not skip."""
+    keep = []
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        formula = ('AND(OR(%s), {Status} != "Inactive", {Status} != "N/A",'
+                   ' NOT({False inactive}))'
+                   % ",".join('RECORD_ID()="%s"' % r for r in chunk))
+        params = [("filterByFormula", formula), ("pageSize", "100"),
+                  ("fields[]", "Project name")]
+        url = "https://api.airtable.com/v0/%s/%s?%s" % (
+            BASE, urllib.parse.quote(TABLE), urllib.parse.urlencode(params))
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + pat})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+        keep.extend((rec["id"], (rec.get("fields") or {}).get("Project name", "?"))
+                    for rec in data.get("records", []))
+    return keep
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--score", type=float, default=25)
+    ap.add_argument("--redo-state", action="store_true")
     ap.add_argument("--chunk", type=int, default=25)
     ap.add_argument("--limit", type=int)
     ap.add_argument("--dry-run", action="store_true")
@@ -84,8 +107,17 @@ def main():
             done = {ln.strip() for ln in fh if ln.strip()}
         print("state file holds %d already-finished id(s)" % len(done))
 
-    print("fetching listings scored %g ..." % args.score)
-    found = fetch_ids(pat, args.score)
+    if args.redo_state:
+        if not done:
+            sys.exit("--redo-state needs a state file with ids in it")
+        print("re-running %d id(s) from %s, minus any now excluded ..." % (len(done), args.state))
+        found = scoreable(pat, sorted(done))
+        os.rename(args.state, args.state + ".redone")
+        done = set()
+        print("state file moved aside to %s.redone" % args.state)
+    else:
+        print("fetching listings scored %g ..." % args.score)
+        found = fetch_ids(pat, args.score)
     remaining = [(rid, name) for rid, name in found if rid not in done]
     todo = remaining[:args.limit] if args.limit else remaining
 
