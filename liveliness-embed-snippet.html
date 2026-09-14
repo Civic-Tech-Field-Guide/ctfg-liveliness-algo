@@ -123,6 +123,47 @@
   if (!widget) return;
   var done = false;
 
+  // Where this ends up on the page.
+  //
+  // Pasted into a Softr custom-code block, the div is already sitting wherever
+  // that block was placed and nothing below applies. Pasted into the page's
+  // header code instead, the HTML parser closes <head> at the div and drops it
+  // at the very top of <body>, above every block. Softr renders each block as
+  // <div id="<hrid>">, so the fix is to move the div under the first Item
+  // details block that has rendered. Blocks render client-side and arrive late,
+  // hence the observer rather than a single look.
+  var MOUNT_AFTER = ["profile-info", "profile-info2", "meta", "more-info", "impact"];
+  var MOUNT_TIMEOUT_MS = 15000;
+  var placed = !(widget.parentNode === document.body);
+
+  function place() {
+    if (placed) return true;
+    for (var i = 0; i < MOUNT_AFTER.length; i++) {
+      var t = document.getElementById(MOUNT_AFTER[i]);
+      if (t && t.parentNode && t !== widget && !t.contains(widget)) {
+        t.parentNode.insertBefore(widget, t.nextSibling);
+        placed = true;
+        log("mounted after block", MOUNT_AFTER[i]);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (!placed && !place() && window.MutationObserver) {
+    var mo = new MutationObserver(function () { if (place()) mo.disconnect(); });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(function () {
+      mo.disconnect();
+      if (!placed && window.console) {
+        console.warn("[ctfg] activity meter: none of the blocks it anchors to " +
+                     "(" + MOUNT_AFTER.join(", ") + ") appeared within " +
+                     (MOUNT_TIMEOUT_MS / 1000) + "s, so it stayed at the top of the " +
+                     "page. Check the block hrids on this page template.");
+      }
+    }, MOUNT_TIMEOUT_MS);
+  }
+
   var MONTHS = ["January", "February", "March", "April", "May", "June", "July",
                 "August", "September", "October", "November", "December"];
 
