@@ -10,11 +10,17 @@ alive, and occasionally a signal read too generously.
 
     python3 report_edges.py [backfill.log]
 """
+import json
+import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 from datetime import date
 
 LOG = sys.argv[1] if len(sys.argv) > 1 else "backfill.log"
+BASE = "appYHxsLYleU2RVYk"
+TABLE = "Listings"
 TODAY = date.today()
 PROFILE = "https://app.civictech.guide/p/?recordId=%s"
 
@@ -87,15 +93,59 @@ for r in records:
     if r["page"] and n is not None and n > 0:
         buckets["Scored on the page alone — no repo, feed or social signal"].append((r, a))
 
+def fetch_fields(ids):
+    """
+    id -> {name, site} for the records being reported. Needs AIRTABLE_PAT.
+
+    Looked up by record id rather than paired positionally with the log's
+    detail blocks. The log interleaves several runs, each with its own detail
+    section and its own summary table, and a record that times out prints no
+    score line at all — so counting blocks against rows drifts, and a drift of
+    one silently prints every project under its neighbour's name.
+    """
+    pat = os.environ.get("AIRTABLE_PAT") or os.environ.get("AIRTABLE_API_KEY")
+    if not pat or not ids:
+        return {}
+    out = {}
+    ids = sorted(set(ids))
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        formula = "OR(%s)" % ",".join('RECORD_ID()="%s"' % r for r in chunk)
+        params = [("filterByFormula", formula), ("pageSize", "100"),
+                  ("fields[]", "Website URL"), ("fields[]", "Project name")]
+        url = "https://api.airtable.com/v0/%s/%s?%s" % (
+            BASE, urllib.parse.quote(TABLE), urllib.parse.urlencode(params))
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + pat})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.load(r)
+        except Exception as e:
+            print("  (could not fetch website urls: %s)" % e, file=sys.stderr)
+            return out
+        for rec in data.get("records", []):
+            f = rec.get("fields") or {}
+            out[rec["id"]] = {"name": f.get("Project name"), "site": f.get("Website URL")}
+    return out
+
+
+reported = [r["id"] for rows in buckets.values() for r, _ in rows]
+lookup = fetch_fields(reported)
+if not lookup and reported:
+    print("(set AIRTABLE_PAT for project names and website urls)\n", file=sys.stderr)
+
 print("%d record(s) in %s\n" % (len(records), LOG))
 for title, rows in buckets.items():
     print("=== %s: %d ===" % (title, len(rows)))
     for r, a in rows[:12]:
         age = "no date" if a is None else "%.1f yrs" % (a / 365.25)
-        print("  %-42s %-6s %-16s %s" % (r["name"][:42], r["score"], r["activity"], age))
+        info = lookup.get(r["id"]) or {}
+        name = info.get("name") or r["name"]
+        print("  %-42s %-6s %-16s %s" % (name[:42], r["score"], r["activity"], age))
         if r["page"]:
             print("       via %s" % r["page"][:88])
-        print("       %s" % (PROFILE % r["id"]))
+        if info.get("site"):
+            print("       site    %s" % info["site"])
+        print("       profile %s" % (PROFILE % r["id"]))
     if len(rows) > 12:
         print("  ... and %d more" % (len(rows) - 12))
     print()
