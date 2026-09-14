@@ -6,10 +6,15 @@
        Liveliness score, Activity status, Last activity date,
        Last timeliness check, Score breakdown, False inactive
 
-     It finds them by listening for Softr's record event. Give it the List
-     Details block's id so it can name the event:
+     It finds them by listening for Softr's record event. Give it the Item
+     Details block's id so it can name the event. The ids are the block hrids,
+     NOT the block type: on app.civictech.guide's profile page (verified from
+     the published page config, 2026-09-14) the Item details blocks are
+     profile-info, profile-info2, video, open-source, more-info, impact, meta,
+     job-posts, item-details5, events-page, item-details10, founded and closed.
+     There is no block called "list-details1". The main one is profile-info:
 
-       <div id="ctfg-liveliness" data-block-id="list-details1">
+       <div id="ctfg-liveliness" data-block-id="profile-info">
 
      Several ids can be given, comma separated. Without any it still catches
      the generic update-record event and any get-record-* event dispatched on
@@ -269,12 +274,15 @@
       return;
     }
 
-    if (rawScore == null || rawScore === "") return;   // never scored
-    var score = Number(rawScore);
-    if (!isFinite(score)) return;
-
+    // Unknown is a verdict, not a gap. The scorer clears the score on purpose
+    // when nothing dated was found, so a missing score with this status still
+    // has something to say. Only a record never checked at all falls through.
     var unknown = status === "Unknown";
-    var label   = unknown ? "Not enough to tell" : (status || bandFor(score));
+    if (!unknown && (rawScore == null || rawScore === "")) return;   // never scored
+    var score = unknown ? 0 : Number(rawScore);
+    if (!unknown && !isFinite(score)) return;
+
+    var label = unknown ? "Not enough to tell" : (status || bandFor(score));
 
     var html = heading(unknown
       ? "<strong>" + esc(label) + "</strong>"
@@ -292,8 +300,8 @@
       '<p class="ctfg-lv-ends"><span>Inactive</span><span>Active</span></p>';
 
     if (unknown) {
-      html += '<p class="ctfg-lv-when">Nothing on this listing could be checked, so ' +
-        "there is no score either way.</p>";
+      html += '<p class="ctfg-lv-when">No dated activity was found for this listing, ' +
+        "so there is no reading either way.</p>";
     } else if (pick(f, "lastActivity")) {
       html += '<p class="ctfg-lv-when">Last sign of activity <strong>' +
         esc(fmtDate(pick(f, "lastActivity"))) + "</strong></p>";
@@ -301,7 +309,7 @@
 
     // The stored breakdown ends with a Total line that repeats the reading in
     // the heading, so it is dropped rather than said twice.
-    var lines = unknown ? [] : String(breakdown || "").split("\n")
+    var lines = String(breakdown || "").split("\n")
       .map(function (l) { return l.trim(); })
       .filter(function (l) { return l && !/^total:/i.test(l); });
 
@@ -316,11 +324,14 @@
   // ── Where the record comes from ────────────────────────────────────────────
 
   // Hard-coded values on the div, for previewing the thing outside Softr.
-  var attrScore = widget.getAttribute("data-score");
-  if (attrScore !== null) {
+  var attrScore  = widget.getAttribute("data-score");
+  var attrStatus = widget.getAttribute("data-status");
+  // Either one is enough to preview: the Unknown state deliberately carries no
+  // score, so gating on the score alone made that state impossible to see.
+  if (attrScore !== null || attrStatus !== null) {
     render({
       "Liveliness score":      attrScore,
-      "Activity status":       widget.getAttribute("data-status"),
+      "Activity status":       attrStatus,
       "Last activity date":    widget.getAttribute("data-last-activity"),
       "Last timeliness check": widget.getAttribute("data-last-check"),
       "Score breakdown":       (widget.getAttribute("data-breakdown") || "").split("|").join("\n"),

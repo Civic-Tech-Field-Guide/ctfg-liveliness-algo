@@ -1293,6 +1293,12 @@ def check_social_recency(url):
 # recency is scored separately by social_recency_score(), which is unaffected.
 SOCIAL_REACHABLE_BONUS_MAX = 10
 
+# A listing added to the directory recently, with the launch field filled in, is
+# very likely still running whatever dated signals exist for it. Treated as a
+# floor rather than a cap: real measured evidence above this still wins.
+RECENT_LAUNCH_DAYS  = 274   # ~9 months
+RECENT_LAUNCH_SCORE = 60    # lands in the "Likely Active" band
+
 # A live homepage is only evidence of current work alongside something dated and
 # recent. A site that loads while the newest signal is over a year old earns the
 # reduced bonus: enough to keep the listing off the dead-site penalty, not enough
@@ -1380,6 +1386,31 @@ def _adjustment(label, nominal, applied):
     if applied == 0:
         return f"{label} (no change, the score cannot go {limit})"
     return f"{label} ({applied:+g}, because the score cannot go {limit})"
+
+
+def recently_launched(rec, now):
+    """
+    True when the listing was added in the last RECENT_LAUNCH_DAYS and carries
+    anything in the "New launch?" field.
+
+    Distinct from the is_excluded() launch rule, which drops a record from
+    scoring entirely and needs both an "x" and a launch date in the current
+    year. This is deliberately looser: any non-empty value plus a recent
+    createdTime is evidence the project is still there, and evidence is what
+    the undated case is short of.
+    """
+    if not str(rec.get("fields", {}).get(F_NEW_LAUNCH) or "").strip():
+        return False
+    created = rec.get("createdTime")
+    if not created:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (now - dt).days <= RECENT_LAUNCH_DAYS
 
 
 def website_alive_bonus(best_date, now):
@@ -1657,19 +1688,44 @@ def compute_liveliness(rec):
             f"{'' if accessible_count == 1 else 's'} reachable",
             social_bonus, score - before))
 
-    # Floor: website up but no dated signals → benefit of the doubt
-    if best_date is None and website_alive is True and not is_archived:
-        if score < 25:
-            why.append("Nothing dated to go on, but the site is up, so the score is "
-                       "given the benefit of the doubt (floor 25)")
-        score = max(score, 25)
+    # A recent launch is evidence in its own right, and the only positive
+    # evidence available for a listing with nothing dated anywhere. Applied as a
+    # floor so a measured score above it is left alone.
+    recent_launch = recently_launched(rec, now)
+    if recent_launch:
+        before = score
+        score  = max(score, RECENT_LAUNCH_SCORE)
+        if score > before:
+            why.append(_adjustment(
+                "Added to the directory in the last nine months and marked as a launch, "
+                "so it is very likely still running",
+                RECENT_LAUNCH_SCORE - before, score - before))
+        else:
+            why.append("Added to the directory in the last nine months and marked as a "
+                       "launch, but the signals found already score higher than that on "
+                       "their own")
 
     # Fully unknown: nothing could be checked at all
     no_signals = (best_date is None and website_alive is None and accessible_count == 0)
 
+    # Nothing dated was found anywhere. A reachable website says the address still
+    # resolves, not that anyone is still behind it, so this reports Unknown rather
+    # than a floor score. A floor reads as a measurement to whoever sees the
+    # profile, and "we found nothing" is not the same claim as "this looks
+    # inactive". A site that failed to respond, an archive snapshot and a recent
+    # launch all carry real evidence, so none of them land here.
+    undated = (best_date is None
+               and not recent_launch
+               and not is_archived
+               and website_alive is not False)
+
+    unknown = no_signals or undated
+
     score  = round(score, 1)
-    activity_status = "Unknown" if no_signals else score_to_activity_status(score)
-    status          = None      if no_signals else score_to_status(score)
+    activity_status = "Unknown" if unknown else score_to_activity_status(score)
+    status          = None      if unknown else score_to_status(score)
+    if unknown:
+        score = None            # clears the field rather than publishing a number
 
     if no_signals and is_archived:
         why = ["The address on this listing is an archive snapshot, and the original "
@@ -1677,12 +1733,18 @@ def compute_liveliness(rec):
     elif no_signals:
         why = ["Nothing on this listing could be checked: no working website address, "
                "no code repository, no feed and no reachable social accounts."]
+    elif undated:
+        why.append("Nothing dated was found in code, feeds or social posts, so there is "
+                   "no evidence either way about whether this project is still running. "
+                   "A reachable website only shows the address still resolves. Reported "
+                   "as Unknown rather than scored.")
     else:
         why.append(f"Total: {score:g} out of 100 - {activity_status}")
     breakdown = "\n".join(why)
 
     last_activity_str = best_date.strftime("%Y-%m-%d") if best_date else None
-    print(f"    → score={score}  activity={activity_status}  status={status or '(no change)'}  last_activity={last_activity_str}")
+    print(f"    → score={'(cleared)' if score is None else score}  activity={activity_status}  "
+          f"status={status or '(no change)'}  last_activity={last_activity_str}")
     if discovered_url:
         print(f"    → discovered homepage: {discovered_url}  (original was article URL)")
 
