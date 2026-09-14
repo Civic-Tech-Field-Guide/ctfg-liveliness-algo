@@ -1762,8 +1762,19 @@ def main():
         print(f"Fetching next {BATCH_SIZE} projects to check...")
         records = fetch_batch()
     if not records:
-        print("No eligible records found.")
-        return
+        # Nothing to check is not a healthy state. Both queues are meant to
+        # always have something: the never-checked pool, or failing that the
+        # oldest-checked records due for a re-check. Coming up empty means the
+        # queue is jammed, and exiting 0 would leave the scheduled run green
+        # while nothing gets scored for weeks.
+        if args.records:
+            msg = "None of the specified record IDs could be fetched."
+        else:
+            msg = ("No eligible records found. The scoring queue is stalled. "
+                   "Check fetch_batch() paging and the is_excluded() rules.")
+        print(f"::error::{msg}")
+        print(msg, file=sys.stderr)
+        sys.exit(1)
 
     print(f"Got {len(records)} records.\n")
     today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
