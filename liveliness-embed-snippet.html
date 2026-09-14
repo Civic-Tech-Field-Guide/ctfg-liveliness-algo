@@ -145,6 +145,39 @@
     return "Inactive";
   }
 
+  // Field names arrive from Airtable as the curator typed them, and the widget
+  // is pasted into Softr by hand, so a rename or a stray capital would silently
+  // blank the whole thing. Match on letters and digits only.
+  function norm(k) { return String(k).toLowerCase().replace(/[^a-z0-9]/g, ""); }
+
+  var ALIASES = {
+    score:         ["livelinessscore", "activityscore", "liveliness"],
+    status:        ["activitystatus"],
+    lastActivity:  ["lastactivitydate", "lastactivity"],
+    lastCheck:     ["lasttimelinesscheck", "lastcheck"],
+    breakdown:     ["scorebreakdown", "breakdown"],
+    falseInactive: ["falseinactive"]
+  };
+
+  function pick(fields, which) {
+    var want = ALIASES[which], index = {};
+    for (var k in fields) if (Object.prototype.hasOwnProperty.call(fields, k)) {
+      index[norm(k)] = fields[k];
+    }
+    for (var i = 0; i < want.length; i++) {
+      if (index[want[i]] !== undefined) return index[want[i]];
+    }
+    return undefined;
+  }
+
+  // Turned on with ?ctfgdebug=1 on the profile URL, or CTFG_DEBUG = true in the
+  // console. Silent otherwise apart from the one warning below, which only
+  // fires when a record arrived and could not be read.
+  var DEBUG = /[?&]ctfgdebug=1/.test(location.search) || window.CTFG_DEBUG === true;
+  function log() {
+    if (DEBUG && window.console) console.log.apply(console, ["[ctfg]"].concat([].slice.call(arguments)));
+  }
+
   function truthy(v) {
     if (v === true) return true;
     if (v === false || v == null || v === "") return false;
@@ -200,10 +233,20 @@
   function render(f, recordId) {
     if (done || !f) return;
 
-    var status     = f["Activity status"];
-    var rawScore   = f["Liveliness score"];
-    var lastCheck  = f["Last timeliness check"];
-    var breakdown  = f["Score breakdown"];
+    var status     = pick(f, "status");
+    var rawScore   = pick(f, "score");
+    var lastCheck  = pick(f, "lastCheck");
+    var breakdown  = pick(f, "breakdown");
+
+    log("record", recordId, "fields:", Object.keys(f));
+
+    // A record came through but carries no score under any name we know. Either
+    // the block is not passing the field or it has been renamed in Airtable.
+    // Say so once rather than leaving a blank space on the page.
+    if (rawScore === undefined && pick(f, "falseInactive") === undefined && window.console) {
+      console.warn("[ctfg] activity meter: no score field in this record. " +
+                   "Fields received: " + Object.keys(f).join(", "));
+    }
 
     // A correction the curator has filed but the next run has not processed
     // yet. Nothing here is true any more, so say nothing.
@@ -211,7 +254,7 @@
 
     // A curator overruled the algorithm, which forces the score to 100. That is
     // a human verdict, not a full bar earned on the evidence.
-    if (truthy(f["False inactive"])) {
+    if (truthy(pick(f, "falseInactive"))) {
       var verdict = status === "Inactive"
         ? "A Field Guide curator has reviewed this listing and recorded the project " +
           "as inactive, so it is not scored automatically."
@@ -251,9 +294,9 @@
     if (unknown) {
       html += '<p class="ctfg-lv-when">Nothing on this listing could be checked, so ' +
         "there is no score either way.</p>";
-    } else if (f["Last activity date"]) {
+    } else if (pick(f, "lastActivity")) {
       html += '<p class="ctfg-lv-when">Last sign of activity <strong>' +
-        esc(fmtDate(f["Last activity date"])) + "</strong></p>";
+        esc(fmtDate(pick(f, "lastActivity"))) + "</strong></p>";
     }
 
     // The stored breakdown ends with a Total line that repeats the reading in
@@ -286,18 +329,33 @@
     return;
   }
 
+  var heard = false;
+
   function fromEvent(e) {
     if (!e || !e.detail) return;
+    heard = true;
     render(e.detail.fields, e.detail.id);
   }
 
-  document.addEventListener("update-record", fromEvent);
+  // Softr may render a custom code block inside an iframe, in which case the
+  // record event is dispatched on the parent document and never reaches this
+  // one. Listen on both. Cross-origin access throws, so it is guarded.
+  var docs = [document];
+  try {
+    if (window.parent && window.parent !== window && window.parent.document &&
+        window.parent.document !== document) {
+      docs.push(window.parent.document);
+    }
+  } catch (err) { log("parent document not reachable"); }
+  log("listening on", docs.length, "document(s); framed:", window.parent !== window);
+
+  docs.forEach(function (d) { d.addEventListener("update-record", fromEvent); });
 
   var seen = {};
   function listenTo(blockId) {
     if (!blockId || seen[blockId]) return;
     seen[blockId] = true;
-    document.addEventListener("get-record-" + blockId, fromEvent);
+    docs.forEach(function (d) { d.addEventListener("get-record-" + blockId, fromEvent); });
   }
 
   (widget.getAttribute("data-block-id") || "").split(",").forEach(function (id) {
@@ -307,31 +365,50 @@
   // Softr names the event after the block, and the block id is not knowable
   // from here. Watch what the page actually dispatches instead of guessing:
   // the wrapper is additive and always calls through.
-  try {
-    var native = document.dispatchEvent;
-    var patched = function (e) {
-      if (e && typeof e.type === "string" && e.type.indexOf("get-record-") === 0) {
-        try { fromEvent(e); } catch (err) { /* never break the host page */ }
-      }
-      return native.apply(this, arguments);
-    };
-    document.dispatchEvent = patched;
-    // Only ever undo our own wrapper: another script may have layered one on
-    // top in the meantime, and clobbering that would break the host page.
-    unhook = function () {
-      if (document.dispatchEvent === patched) document.dispatchEvent = native;
-    };
-  } catch (err) { /* leave the other paths to it */ }
+  var unhooks = [];
+  docs.forEach(function (d) {
+    try {
+      var native = d.dispatchEvent;
+      var patched = function (e) {
+        if (e && typeof e.type === "string" && e.type.indexOf("get-record-") === 0) {
+          log("saw event", e.type);
+          try { fromEvent(e); } catch (err) { /* never break the host page */ }
+        }
+        return native.apply(this, arguments);
+      };
+      d.dispatchEvent = patched;
+      // Only ever undo our own wrapper: another script may have layered one on
+      // top in the meantime, and clobbering that would break the host page.
+      unhooks.push(function () {
+        if (d.dispatchEvent === patched) d.dispatchEvent = native;
+      });
+    } catch (err) { /* leave the other paths to it */ }
+  });
+  if (unhooks.length) {
+    unhook = function () { unhooks.forEach(function (fn) { fn(); }); };
+  }
 
   // Blocks added to the page after this ran, so their event is still to come.
   // The wrapper above already catches those; this is the belt to its braces,
   // and neither can recover an event dispatched before this script executed.
   var obs = new MutationObserver(function () {
     if (done) { obs.disconnect(); return; }
-    var nodes = document.querySelectorAll('[id^="list-details"],[id^="list-detail"]');
-    for (var i = 0; i < nodes.length; i++) listenTo(nodes[i].id);
+    docs.forEach(function (d) {
+      var nodes = d.querySelectorAll('[id^="list-details"],[id^="list-detail"]');
+      for (var i = 0; i < nodes.length; i++) listenTo(nodes[i].id);
+    });
   });
   obs.observe(document.documentElement, { childList: true, subtree: true });
   setTimeout(function () { obs.disconnect(); }, 15000);
+
+  // Nothing at all came through. That is a different fault from a record with
+  // no score, and it needs a different fix, so it gets its own message.
+  setTimeout(function () {
+    if (!done && !heard && window.console) {
+      console.warn("[ctfg] activity meter: no record event reached the block in 8s. " +
+                   "The custom code block may sit outside the details block, or in a frame " +
+                   "the event does not cross. Framed: " + (window.parent !== window) + ".");
+    }
+  }, 8000);
 })();
 </script>
