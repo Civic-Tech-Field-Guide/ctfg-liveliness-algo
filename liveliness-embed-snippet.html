@@ -1,0 +1,466 @@
+<!-- CTFG project activity meter — paste into a Softr custom-code block on the
+     listing detail page template. Source of truth is this file in
+     github.com/Civic-Tech-Field-Guide/ctfg-liveliness-algo; Softr holds a copy.
+
+     The block it sits on must expose these Airtable fields, by these names:
+       Liveliness score, Activity status, Last activity date,
+       Last timeliness check, Score breakdown, False inactive
+
+     It finds them by listening for Softr's record event. Give it the Item
+     Details block's id so it can name the event. The ids are the block hrids,
+     NOT the block type: on app.civictech.guide's profile page (verified from
+     the published page config, 2026-09-14) the Item details blocks are
+     profile-info, profile-info2, video, open-source, more-info, impact, meta,
+     job-posts, item-details5, events-page, item-details10, founded and closed.
+     There is no block called "list-details1". The main one is profile-info:
+
+       <div id="ctfg-liveliness" data-block-id="profile-info">
+
+     Several ids can be given, comma separated. Without any it still catches
+     the generic update-record event and any get-record-* event dispatched on
+     the document, which covers most page templates.
+
+     Nothing is rendered until real values arrive, so a listing that has never
+     been scored, or a page where the event never fires, shows no widget at
+     all rather than an empty meter.
+
+     For local preview, hard-code values instead:
+       data-score="78" data-status="Likely Active" data-last-activity="2026-07-12"
+       data-last-check="2026-09-02" data-breakdown="line one|line two" -->
+
+<div id="ctfg-liveliness" style="display:none">
+  <style>
+    #ctfg-liveliness {
+      max-width: 700px;
+      margin: 0 auto;
+      padding: 20px 22px;
+      background: #FFFFFF;
+      border: 1px solid #CDCDCB;
+      border-radius: 8px;
+      font-family: inherit;
+      color: #19191E;
+      font-size: 14px;
+      line-height: 1.5;
+      font-weight: 400;
+      box-sizing: border-box;
+    }
+    #ctfg-liveliness *, #ctfg-liveliness *::before { box-sizing: inherit; }
+    .ctfg-lv-head {
+      display: flex; flex-wrap: wrap; align-items: baseline;
+      justify-content: space-between; gap: 4px 16px; margin-bottom: 14px;
+    }
+    .ctfg-lv-title {
+      font-size: 12px; font-weight: 600; letter-spacing: 0.07em;
+      text-transform: uppercase; color: #6B6B68; margin: 0;
+    }
+    .ctfg-lv-read { font-size: 14px; margin: 0; color: #6B6B68; }
+    .ctfg-lv-read strong { font-weight: 600; color: #19191E; }
+    .ctfg-lv-track {
+      position: relative; height: 8px; border-radius: 3px;
+      background: linear-gradient(90deg, #9FA4A3 0%, #A9C2B0 30%,
+                  #86D3B4 60%, #3FC79A 80%, #01B583 100%);
+    }
+    .ctfg-lv-track.ctfg-lv-flat { background: #E4E4E2; }
+    .ctfg-lv-mark {
+      position: absolute; top: -4px; width: 2px; height: 16px;
+      background: #19191E; border-radius: 1px; transform: translateX(-1px);
+    }
+    .ctfg-lv-ends {
+      display: flex; justify-content: space-between;
+      margin: 7px 0 0; font-size: 12px; color: #6B6B68;
+    }
+    .ctfg-lv-when { margin: 16px 0 0; font-size: 13px; color: #6B6B68; }
+    .ctfg-lv-when strong { font-weight: 600; color: #19191E; }
+    .ctfg-lv-why { margin: 16px 0 0; padding: 0; list-style: none; }
+    .ctfg-lv-why li {
+      position: relative; padding-left: 15px; margin: 0 0 5px; font-size: 13px;
+    }
+    .ctfg-lv-why li::before {
+      content: ""; position: absolute; left: 0; top: 8px;
+      width: 5px; height: 1px; background: #9FA4A3;
+    }
+    .ctfg-lv-note { margin: 0; font-size: 13px; color: #19191E; }
+    .ctfg-lv-foot {
+      margin-top: 16px; padding-top: 14px; border-top: 1px solid #CDCDCB;
+      font-size: 12px; color: #6B6B68;
+    }
+    .ctfg-lv-foot summary {
+      cursor: pointer; list-style: none; display: flex; flex-wrap: wrap;
+      align-items: baseline; justify-content: space-between; gap: 2px 12px;
+    }
+    .ctfg-lv-foot summary::-webkit-details-marker { display: none; }
+    .ctfg-lv-foot summary > span:first-child { color: #574FD9; font-weight: 600; }
+    .ctfg-lv-foot summary > span:first-child::after {
+      content: "\203A"; display: inline-block; margin-left: 5px;
+    }
+    .ctfg-lv-foot[open] summary > span:first-child::after { transform: rotate(90deg); }
+    .ctfg-lv-foot summary:hover > span:first-child {
+      color: #1F1A73; text-decoration: underline;
+    }
+    .ctfg-lv-checked { color: #6B6B68; }
+    .ctfg-lv-foot p { margin: 10px 0 0; }
+    .ctfg-lv-foot a { color: #574FD9; }
+    .ctfg-lv-foot a:hover { color: #1F1A73; }
+    .ctfg-lv-bands {
+      margin: 10px 0 0; border-collapse: collapse; font-size: 12px; width: 100%;
+      max-width: 340px;
+    }
+    .ctfg-lv-bands th, .ctfg-lv-bands td {
+      text-align: left; padding: 3px 12px 3px 0; font-weight: 400;
+      color: #6B6B68; border-bottom: 1px solid #CDCDCB;
+    }
+    .ctfg-lv-bands th { white-space: nowrap; color: #19191E; }
+  </style>
+</div>
+
+<script>
+(function () {
+  var REPO = "https://github.com/Civic-Tech-Field-Guide/ctfg-liveliness-algo";
+  var DISPUTE = "https://civictechguide.fillout.com/t/vUEPgtkWHtus";
+  var SCORED_WRONG = "Claude scored wrong";  // internal Airtable value, never shown
+
+  var widget = document.getElementById("ctfg-liveliness");
+  if (!widget) return;
+  var done = false;
+
+  // Where this ends up on the page.
+  //
+  // Pasted into a Softr custom-code block, the div is already sitting wherever
+  // that block was placed and nothing below applies. Pasted into the page's
+  // header code instead, the HTML parser closes <head> at the div and drops it
+  // at the very top of <body>, above every block. Softr renders each block as
+  // <div id="<hrid>">, so the fix is to move the div under the first Item
+  // details block that has rendered. Blocks render client-side and arrive late,
+  // hence the observer rather than a single look.
+  var MOUNT_AFTER = ["profile-info", "profile-info2", "meta", "more-info", "impact"];
+  var MOUNT_TIMEOUT_MS = 15000;
+  var placed = !(widget.parentNode === document.body);
+
+  function place() {
+    if (placed) return true;
+    for (var i = 0; i < MOUNT_AFTER.length; i++) {
+      var t = document.getElementById(MOUNT_AFTER[i]);
+      if (t && t.parentNode && t !== widget && !t.contains(widget)) {
+        t.parentNode.insertBefore(widget, t.nextSibling);
+        placed = true;
+        log("mounted after block", MOUNT_AFTER[i]);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (!placed && !place() && window.MutationObserver) {
+    var mo = new MutationObserver(function () { if (place()) mo.disconnect(); });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+    setTimeout(function () {
+      mo.disconnect();
+      if (!placed && window.console) {
+        console.warn("[ctfg] activity meter: none of the blocks it anchors to " +
+                     "(" + MOUNT_AFTER.join(", ") + ") appeared within " +
+                     (MOUNT_TIMEOUT_MS / 1000) + "s, so it stayed at the top of the " +
+                     "page. Check the block hrids on this page template.");
+      }
+    }, MOUNT_TIMEOUT_MS);
+  }
+
+  var MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+                "August", "September", "October", "November", "December"];
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // Airtable dates arrive as YYYY-MM-DD. Parsed by hand rather than through
+  // Date, which reads them as UTC midnight and lands on the previous day for
+  // anyone west of Greenwich.
+  function fmtDate(iso) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso == null ? "" : iso));
+    if (!m) return "";
+    return Number(m[3]) + " " + MONTHS[Number(m[2]) - 1] + " " + m[1];
+  }
+
+  // Mirrors score_to_activity_status() in timeliness_check.py. Used only when
+  // Activity status is missing; the stored value wins whenever there is one.
+  function bandFor(score) {
+    if (score >= 70) return "Active";
+    if (score >= 45) return "Likely Active";
+    if (score >= 20) return "Possibly Inactive";
+    return "Inactive";
+  }
+
+  // Field names arrive from Airtable as the curator typed them, and the widget
+  // is pasted into Softr by hand, so a rename or a stray capital would silently
+  // blank the whole thing. Match on letters and digits only.
+  function norm(k) { return String(k).toLowerCase().replace(/[^a-z0-9]/g, ""); }
+
+  var ALIASES = {
+    score:         ["livelinessscore", "activityscore", "liveliness"],
+    status:        ["activitystatus"],
+    lastActivity:  ["lastactivitydate", "lastactivity"],
+    lastCheck:     ["lasttimelinesscheck", "lastcheck"],
+    breakdown:     ["scorebreakdown", "breakdown"],
+    falseInactive: ["falseinactive"]
+  };
+
+  function pick(fields, which) {
+    var want = ALIASES[which], index = {};
+    for (var k in fields) if (Object.prototype.hasOwnProperty.call(fields, k)) {
+      index[norm(k)] = fields[k];
+    }
+    for (var i = 0; i < want.length; i++) {
+      if (index[want[i]] !== undefined) return index[want[i]];
+    }
+    return undefined;
+  }
+
+  // Turned on with ?ctfgdebug=1 on the profile URL, or CTFG_DEBUG = true in the
+  // console. Silent otherwise apart from the one warning below, which only
+  // fires when a record arrived and could not be read.
+  var DEBUG = /[?&]ctfgdebug=1/.test(location.search) || window.CTFG_DEBUG === true;
+  function log() {
+    if (DEBUG && window.console) console.log.apply(console, ["[ctfg]"].concat([].slice.call(arguments)));
+  }
+
+  function truthy(v) {
+    if (v === true) return true;
+    if (v === false || v == null || v === "") return false;
+    var t = String(v).trim().toLowerCase();
+    return t !== "false" && t !== "0" && t !== "no" && t !== "off" && t !== "unchecked";
+  }
+
+  function methodPanel(lastCheck, recordId) {
+    var dispute = recordId
+      ? '<p>If this looks wrong, <a href="' + esc(DISPUTE) + "?id=" + esc(recordId) +
+        '" target="_blank" rel="noopener">tell us</a> and a curator will check it.</p>'
+      : "";
+    return '<details class="ctfg-lv-foot">' +
+      "<summary><span>How this is measured</span>" +
+      (lastCheck ? '<span class="ctfg-lv-checked">Checked ' +
+                   esc(fmtDate(lastCheck)) + "</span>" : "") +
+      "</summary>" +
+      "<p>Every listing is checked for signs of recent work: commits and releases on " +
+      "GitHub, entries in a blog feed, posts on social accounts, and whether the " +
+      "website still answers. The most recent dated signal sets the score. A site " +
+      "that responds adds to it, one that does not takes 50 off, and social accounts " +
+      "that merely load are worth 10 between them. How much of the recent issue and " +
+      "pull request traffic a project closes moves it by 5 either way.</p>" +
+      '<table class="ctfg-lv-bands"><tbody>' +
+      "<tr><th>70 to 100</th><td>Active</td></tr>" +
+      "<tr><th>45 to 69</th><td>Likely Active</td></tr>" +
+      "<tr><th>20 to 44</th><td>Possibly Inactive</td></tr>" +
+      "<tr><th>0 to 19</th><td>Inactive</td></tr>" +
+      "<tr><th>Unknown</th><td>nothing could be checked</td></tr>" +
+      "</tbody></table>" +
+      '<p>The code that works this out is open source, and the whole method is ' +
+      'written up in <a href="' + esc(REPO) + '" target="_blank" rel="noopener">' +
+      "the repository</a>.</p>" +
+      dispute +
+      "</details>";
+  }
+
+  function heading(right) {
+    return '<div class="ctfg-lv-head">' +
+      '<p class="ctfg-lv-title">Project activity</p>' +
+      '<p class="ctfg-lv-read">' + right + "</p></div>";
+  }
+
+  var unhook = null;
+
+  function show(html) {
+    widget.insertAdjacentHTML("beforeend", html);
+    widget.style.display = "block";
+    done = true;
+    if (unhook) { unhook(); unhook = null; }
+  }
+
+  function render(f, recordId) {
+    if (done || !f) return;
+
+    var status     = pick(f, "status");
+    var rawScore   = pick(f, "score");
+    var lastCheck  = pick(f, "lastCheck");
+    var breakdown  = pick(f, "breakdown");
+
+    log("record", recordId, "fields:", Object.keys(f));
+
+    // A record came through but carries no score under any name we know. Either
+    // the block is not passing the field or it has been renamed in Airtable.
+    // Say so once rather than leaving a blank space on the page.
+    if (rawScore === undefined && pick(f, "falseInactive") === undefined && window.console) {
+      console.warn("[ctfg] activity meter: no score field in this record. " +
+                   "Fields received: " + Object.keys(f).join(", "));
+    }
+
+    // A correction the curator has filed but the next run has not processed
+    // yet. Nothing here is true any more, so say nothing.
+    if (status === SCORED_WRONG) return;
+
+    // A curator overruled the algorithm, which forces the score to 100. That is
+    // a human verdict, not a full bar earned on the evidence.
+    if (truthy(pick(f, "falseInactive"))) {
+      var verdict = status === "Inactive"
+        ? "A Field Guide curator has reviewed this listing and recorded the project " +
+          "as inactive, so it is not scored automatically."
+        : status === "Active"
+          ? "A Field Guide curator has checked this project and confirmed it is " +
+            "still going, so it is not scored automatically."
+          : "A Field Guide curator has reviewed this listing, so it is not scored " +
+            "automatically.";
+      show(heading("<strong>" + esc(status || "Reviewed by a curator") + "</strong>") +
+        '<p class="ctfg-lv-note">' + verdict + "</p>" +
+        methodPanel(lastCheck, recordId));
+      return;
+    }
+
+    // Unknown is a verdict, not a gap. The scorer clears the score on purpose
+    // when nothing dated was found, so a missing score with this status still
+    // has something to say. Only a record never checked at all falls through.
+    var unknown = status === "Unknown";
+    if (!unknown && (rawScore == null || rawScore === "")) return;   // never scored
+    var score = unknown ? 0 : Number(rawScore);
+    if (!unknown && !isFinite(score)) return;
+
+    var label = unknown ? "Not enough to tell" : (status || bandFor(score));
+
+    var html = heading(unknown
+      ? "<strong>" + esc(label) + "</strong>"
+      : esc(score) + " / 100 &middot; <strong>" + esc(label) + "</strong>");
+
+    // The marker is nudged off the very ends so a 0 or a 100 stays inside the
+    // track instead of hanging half off it. aria-valuenow keeps the real number.
+    var pos = Math.min(98, Math.max(2, score));
+    html += '<div class="ctfg-lv-track' + (unknown ? " ctfg-lv-flat" : "") +
+      '" role="img" aria-label="' +
+      (unknown ? "Activity could not be measured"
+               : "Activity score " + esc(score) + " out of 100: " + esc(label)) + '">' +
+      (unknown ? "" : '<span class="ctfg-lv-mark" style="left:' + pos + '%"></span>') +
+      "</div>" +
+      '<p class="ctfg-lv-ends"><span>Inactive</span><span>Active</span></p>';
+
+    if (unknown) {
+      html += '<p class="ctfg-lv-when">No dated activity was found for this listing, ' +
+        "so there is no reading either way.</p>";
+    } else if (pick(f, "lastActivity")) {
+      html += '<p class="ctfg-lv-when">Last sign of activity <strong>' +
+        esc(fmtDate(pick(f, "lastActivity"))) + "</strong></p>";
+    }
+
+    // The stored breakdown ends with a Total line that repeats the reading in
+    // the heading, so it is dropped rather than said twice.
+    var lines = String(breakdown || "").split("\n")
+      .map(function (l) { return l.trim(); })
+      .filter(function (l) { return l && !/^total:/i.test(l); });
+
+    if (lines.length) {
+      html += '<ul class="ctfg-lv-why">' +
+        lines.map(function (l) { return "<li>" + esc(l) + "</li>"; }).join("") + "</ul>";
+    }
+
+    show(html + methodPanel(lastCheck, recordId));
+  }
+
+  // ── Where the record comes from ────────────────────────────────────────────
+
+  // Hard-coded values on the div, for previewing the thing outside Softr.
+  var attrScore  = widget.getAttribute("data-score");
+  var attrStatus = widget.getAttribute("data-status");
+  // Either one is enough to preview: the Unknown state deliberately carries no
+  // score, so gating on the score alone made that state impossible to see.
+  if (attrScore !== null || attrStatus !== null) {
+    render({
+      "Liveliness score":      attrScore,
+      "Activity status":       attrStatus,
+      "Last activity date":    widget.getAttribute("data-last-activity"),
+      "Last timeliness check": widget.getAttribute("data-last-check"),
+      "Score breakdown":       (widget.getAttribute("data-breakdown") || "").split("|").join("\n"),
+      "False inactive":        widget.getAttribute("data-false-inactive")
+    }, widget.getAttribute("data-record-id"));
+    return;
+  }
+
+  var heard = false;
+
+  function fromEvent(e) {
+    if (!e || !e.detail) return;
+    heard = true;
+    render(e.detail.fields, e.detail.id);
+  }
+
+  // Softr may render a custom code block inside an iframe, in which case the
+  // record event is dispatched on the parent document and never reaches this
+  // one. Listen on both. Cross-origin access throws, so it is guarded.
+  var docs = [document];
+  try {
+    if (window.parent && window.parent !== window && window.parent.document &&
+        window.parent.document !== document) {
+      docs.push(window.parent.document);
+    }
+  } catch (err) { log("parent document not reachable"); }
+  log("listening on", docs.length, "document(s); framed:", window.parent !== window);
+
+  docs.forEach(function (d) { d.addEventListener("update-record", fromEvent); });
+
+  var seen = {};
+  function listenTo(blockId) {
+    if (!blockId || seen[blockId]) return;
+    seen[blockId] = true;
+    docs.forEach(function (d) { d.addEventListener("get-record-" + blockId, fromEvent); });
+  }
+
+  (widget.getAttribute("data-block-id") || "").split(",").forEach(function (id) {
+    listenTo(id.trim());
+  });
+
+  // Softr names the event after the block, and the block id is not knowable
+  // from here. Watch what the page actually dispatches instead of guessing:
+  // the wrapper is additive and always calls through.
+  var unhooks = [];
+  docs.forEach(function (d) {
+    try {
+      var native = d.dispatchEvent;
+      var patched = function (e) {
+        if (e && typeof e.type === "string" && e.type.indexOf("get-record-") === 0) {
+          log("saw event", e.type);
+          try { fromEvent(e); } catch (err) { /* never break the host page */ }
+        }
+        return native.apply(this, arguments);
+      };
+      d.dispatchEvent = patched;
+      // Only ever undo our own wrapper: another script may have layered one on
+      // top in the meantime, and clobbering that would break the host page.
+      unhooks.push(function () {
+        if (d.dispatchEvent === patched) d.dispatchEvent = native;
+      });
+    } catch (err) { /* leave the other paths to it */ }
+  });
+  if (unhooks.length) {
+    unhook = function () { unhooks.forEach(function (fn) { fn(); }); };
+  }
+
+  // Blocks added to the page after this ran, so their event is still to come.
+  // The wrapper above already catches those; this is the belt to its braces,
+  // and neither can recover an event dispatched before this script executed.
+  var obs = new MutationObserver(function () {
+    if (done) { obs.disconnect(); return; }
+    docs.forEach(function (d) {
+      var nodes = d.querySelectorAll('[id^="list-details"],[id^="list-detail"]');
+      for (var i = 0; i < nodes.length; i++) listenTo(nodes[i].id);
+    });
+  });
+  obs.observe(document.documentElement, { childList: true, subtree: true });
+  setTimeout(function () { obs.disconnect(); }, 15000);
+
+  // Nothing at all came through. That is a different fault from a record with
+  // no score, and it needs a different fix, so it gets its own message.
+  setTimeout(function () {
+    if (!done && !heard && window.console) {
+      console.warn("[ctfg] activity meter: no record event reached the block in 8s. " +
+                   "The custom code block may sit outside the details block, or in a frame " +
+                   "the event does not cross. Framed: " + (window.parent !== window) + ".");
+    }
+  }, 8000);
+})();
+</script>
