@@ -1,0 +1,337 @@
+<!-- CTFG project activity meter — paste into a Softr custom-code block on the
+     listing detail page template. Source of truth is this file in
+     github.com/Civic-Tech-Field-Guide/ctfg-liveliness-algo; Softr holds a copy.
+
+     The block it sits on must expose these Airtable fields, by these names:
+       Liveliness score, Activity status, Last activity date,
+       Last timeliness check, Score breakdown, False inactive
+
+     It finds them by listening for Softr's record event. Give it the List
+     Details block's id so it can name the event:
+
+       <div id="ctfg-liveliness" data-block-id="list-details1">
+
+     Several ids can be given, comma separated. Without any it still catches
+     the generic update-record event and any get-record-* event dispatched on
+     the document, which covers most page templates.
+
+     Nothing is rendered until real values arrive, so a listing that has never
+     been scored, or a page where the event never fires, shows no widget at
+     all rather than an empty meter.
+
+     For local preview, hard-code values instead:
+       data-score="78" data-status="Likely Active" data-last-activity="2026-07-12"
+       data-last-check="2026-09-02" data-breakdown="line one|line two" -->
+
+<div id="ctfg-liveliness" style="display:none">
+  <style>
+    #ctfg-liveliness {
+      max-width: 700px;
+      margin: 0 auto;
+      padding: 20px 22px;
+      background: #FFFFFF;
+      border: 1px solid #CDCDCB;
+      border-radius: 8px;
+      font-family: inherit;
+      color: #19191E;
+      font-size: 14px;
+      line-height: 1.5;
+      font-weight: 400;
+      box-sizing: border-box;
+    }
+    #ctfg-liveliness *, #ctfg-liveliness *::before { box-sizing: inherit; }
+    .ctfg-lv-head {
+      display: flex; flex-wrap: wrap; align-items: baseline;
+      justify-content: space-between; gap: 4px 16px; margin-bottom: 14px;
+    }
+    .ctfg-lv-title {
+      font-size: 12px; font-weight: 600; letter-spacing: 0.07em;
+      text-transform: uppercase; color: #6B6B68; margin: 0;
+    }
+    .ctfg-lv-read { font-size: 14px; margin: 0; color: #6B6B68; }
+    .ctfg-lv-read strong { font-weight: 600; color: #19191E; }
+    .ctfg-lv-track {
+      position: relative; height: 8px; border-radius: 3px;
+      background: linear-gradient(90deg, #9FA4A3 0%, #A9C2B0 30%,
+                  #86D3B4 60%, #3FC79A 80%, #01B583 100%);
+    }
+    .ctfg-lv-track.ctfg-lv-flat { background: #E4E4E2; }
+    .ctfg-lv-mark {
+      position: absolute; top: -4px; width: 2px; height: 16px;
+      background: #19191E; border-radius: 1px; transform: translateX(-1px);
+    }
+    .ctfg-lv-ends {
+      display: flex; justify-content: space-between;
+      margin: 7px 0 0; font-size: 12px; color: #6B6B68;
+    }
+    .ctfg-lv-when { margin: 16px 0 0; font-size: 13px; color: #6B6B68; }
+    .ctfg-lv-when strong { font-weight: 600; color: #19191E; }
+    .ctfg-lv-why { margin: 16px 0 0; padding: 0; list-style: none; }
+    .ctfg-lv-why li {
+      position: relative; padding-left: 15px; margin: 0 0 5px; font-size: 13px;
+    }
+    .ctfg-lv-why li::before {
+      content: ""; position: absolute; left: 0; top: 8px;
+      width: 5px; height: 1px; background: #9FA4A3;
+    }
+    .ctfg-lv-note { margin: 0; font-size: 13px; color: #19191E; }
+    .ctfg-lv-foot {
+      margin-top: 16px; padding-top: 14px; border-top: 1px solid #CDCDCB;
+      font-size: 12px; color: #6B6B68;
+    }
+    .ctfg-lv-foot summary {
+      cursor: pointer; list-style: none; display: flex; flex-wrap: wrap;
+      align-items: baseline; justify-content: space-between; gap: 2px 12px;
+    }
+    .ctfg-lv-foot summary::-webkit-details-marker { display: none; }
+    .ctfg-lv-foot summary > span:first-child { color: #574FD9; font-weight: 600; }
+    .ctfg-lv-foot summary > span:first-child::after {
+      content: "\203A"; display: inline-block; margin-left: 5px;
+    }
+    .ctfg-lv-foot[open] summary > span:first-child::after { transform: rotate(90deg); }
+    .ctfg-lv-foot summary:hover > span:first-child {
+      color: #1F1A73; text-decoration: underline;
+    }
+    .ctfg-lv-checked { color: #6B6B68; }
+    .ctfg-lv-foot p { margin: 10px 0 0; }
+    .ctfg-lv-foot a { color: #574FD9; }
+    .ctfg-lv-foot a:hover { color: #1F1A73; }
+    .ctfg-lv-bands {
+      margin: 10px 0 0; border-collapse: collapse; font-size: 12px; width: 100%;
+      max-width: 340px;
+    }
+    .ctfg-lv-bands th, .ctfg-lv-bands td {
+      text-align: left; padding: 3px 12px 3px 0; font-weight: 400;
+      color: #6B6B68; border-bottom: 1px solid #CDCDCB;
+    }
+    .ctfg-lv-bands th { white-space: nowrap; color: #19191E; }
+  </style>
+</div>
+
+<script>
+(function () {
+  var REPO = "https://github.com/Civic-Tech-Field-Guide/ctfg-liveliness-algo";
+  var DISPUTE = "https://civictechguide.fillout.com/t/vUEPgtkWHtus";
+  var SCORED_WRONG = "Claude scored wrong";  // internal Airtable value, never shown
+
+  var widget = document.getElementById("ctfg-liveliness");
+  if (!widget) return;
+  var done = false;
+
+  var MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+                "August", "September", "October", "November", "December"];
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // Airtable dates arrive as YYYY-MM-DD. Parsed by hand rather than through
+  // Date, which reads them as UTC midnight and lands on the previous day for
+  // anyone west of Greenwich.
+  function fmtDate(iso) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso == null ? "" : iso));
+    if (!m) return "";
+    return Number(m[3]) + " " + MONTHS[Number(m[2]) - 1] + " " + m[1];
+  }
+
+  // Mirrors score_to_activity_status() in timeliness_check.py. Used only when
+  // Activity status is missing; the stored value wins whenever there is one.
+  function bandFor(score) {
+    if (score >= 70) return "Active";
+    if (score >= 45) return "Likely Active";
+    if (score >= 20) return "Possibly Inactive";
+    return "Inactive";
+  }
+
+  function truthy(v) {
+    if (v === true) return true;
+    if (v === false || v == null || v === "") return false;
+    var t = String(v).trim().toLowerCase();
+    return t !== "false" && t !== "0" && t !== "no" && t !== "off" && t !== "unchecked";
+  }
+
+  function methodPanel(lastCheck, recordId) {
+    var dispute = recordId
+      ? '<p>If this looks wrong, <a href="' + esc(DISPUTE) + "?id=" + esc(recordId) +
+        '" target="_blank" rel="noopener">tell us</a> and a curator will check it.</p>'
+      : "";
+    return '<details class="ctfg-lv-foot">' +
+      "<summary><span>How this is measured</span>" +
+      (lastCheck ? '<span class="ctfg-lv-checked">Checked ' +
+                   esc(fmtDate(lastCheck)) + "</span>" : "") +
+      "</summary>" +
+      "<p>Every listing is checked for signs of recent work: commits and releases on " +
+      "GitHub, entries in a blog feed, posts on social accounts, and whether the " +
+      "website still answers. The most recent dated signal sets the score. A site " +
+      "that responds adds to it, one that does not takes 50 off, and social accounts " +
+      "that merely load are worth 10 between them. How much of the recent issue and " +
+      "pull request traffic a project closes moves it by 5 either way.</p>" +
+      '<table class="ctfg-lv-bands"><tbody>' +
+      "<tr><th>70 to 100</th><td>Active</td></tr>" +
+      "<tr><th>45 to 69</th><td>Likely Active</td></tr>" +
+      "<tr><th>20 to 44</th><td>Possibly Inactive</td></tr>" +
+      "<tr><th>0 to 19</th><td>Inactive</td></tr>" +
+      "<tr><th>Unknown</th><td>nothing could be checked</td></tr>" +
+      "</tbody></table>" +
+      '<p>The code that works this out is open source, and the whole method is ' +
+      'written up in <a href="' + esc(REPO) + '" target="_blank" rel="noopener">' +
+      "the repository</a>.</p>" +
+      dispute +
+      "</details>";
+  }
+
+  function heading(right) {
+    return '<div class="ctfg-lv-head">' +
+      '<p class="ctfg-lv-title">Project activity</p>' +
+      '<p class="ctfg-lv-read">' + right + "</p></div>";
+  }
+
+  var unhook = null;
+
+  function show(html) {
+    widget.insertAdjacentHTML("beforeend", html);
+    widget.style.display = "block";
+    done = true;
+    if (unhook) { unhook(); unhook = null; }
+  }
+
+  function render(f, recordId) {
+    if (done || !f) return;
+
+    var status     = f["Activity status"];
+    var rawScore   = f["Liveliness score"];
+    var lastCheck  = f["Last timeliness check"];
+    var breakdown  = f["Score breakdown"];
+
+    // A correction the curator has filed but the next run has not processed
+    // yet. Nothing here is true any more, so say nothing.
+    if (status === SCORED_WRONG) return;
+
+    // A curator overruled the algorithm, which forces the score to 100. That is
+    // a human verdict, not a full bar earned on the evidence.
+    if (truthy(f["False inactive"])) {
+      var verdict = status === "Inactive"
+        ? "A Field Guide curator has reviewed this listing and recorded the project " +
+          "as inactive, so it is not scored automatically."
+        : status === "Active"
+          ? "A Field Guide curator has checked this project and confirmed it is " +
+            "still going, so it is not scored automatically."
+          : "A Field Guide curator has reviewed this listing, so it is not scored " +
+            "automatically.";
+      show(heading("<strong>" + esc(status || "Reviewed by a curator") + "</strong>") +
+        '<p class="ctfg-lv-note">' + verdict + "</p>" +
+        methodPanel(lastCheck, recordId));
+      return;
+    }
+
+    if (rawScore == null || rawScore === "") return;   // never scored
+    var score = Number(rawScore);
+    if (!isFinite(score)) return;
+
+    var unknown = status === "Unknown";
+    var label   = unknown ? "Not enough to tell" : (status || bandFor(score));
+
+    var html = heading(unknown
+      ? "<strong>" + esc(label) + "</strong>"
+      : esc(score) + " / 100 &middot; <strong>" + esc(label) + "</strong>");
+
+    // The marker is nudged off the very ends so a 0 or a 100 stays inside the
+    // track instead of hanging half off it. aria-valuenow keeps the real number.
+    var pos = Math.min(98, Math.max(2, score));
+    html += '<div class="ctfg-lv-track' + (unknown ? " ctfg-lv-flat" : "") +
+      '" role="img" aria-label="' +
+      (unknown ? "Activity could not be measured"
+               : "Activity score " + esc(score) + " out of 100: " + esc(label)) + '">' +
+      (unknown ? "" : '<span class="ctfg-lv-mark" style="left:' + pos + '%"></span>') +
+      "</div>" +
+      '<p class="ctfg-lv-ends"><span>Inactive</span><span>Active</span></p>';
+
+    if (unknown) {
+      html += '<p class="ctfg-lv-when">Nothing on this listing could be checked, so ' +
+        "there is no score either way.</p>";
+    } else if (f["Last activity date"]) {
+      html += '<p class="ctfg-lv-when">Last sign of activity <strong>' +
+        esc(fmtDate(f["Last activity date"])) + "</strong></p>";
+    }
+
+    // The stored breakdown ends with a Total line that repeats the reading in
+    // the heading, so it is dropped rather than said twice.
+    var lines = unknown ? [] : String(breakdown || "").split("\n")
+      .map(function (l) { return l.trim(); })
+      .filter(function (l) { return l && !/^total:/i.test(l); });
+
+    if (lines.length) {
+      html += '<ul class="ctfg-lv-why">' +
+        lines.map(function (l) { return "<li>" + esc(l) + "</li>"; }).join("") + "</ul>";
+    }
+
+    show(html + methodPanel(lastCheck, recordId));
+  }
+
+  // ── Where the record comes from ────────────────────────────────────────────
+
+  // Hard-coded values on the div, for previewing the thing outside Softr.
+  var attrScore = widget.getAttribute("data-score");
+  if (attrScore !== null) {
+    render({
+      "Liveliness score":      attrScore,
+      "Activity status":       widget.getAttribute("data-status"),
+      "Last activity date":    widget.getAttribute("data-last-activity"),
+      "Last timeliness check": widget.getAttribute("data-last-check"),
+      "Score breakdown":       (widget.getAttribute("data-breakdown") || "").split("|").join("\n"),
+      "False inactive":        widget.getAttribute("data-false-inactive")
+    }, widget.getAttribute("data-record-id"));
+    return;
+  }
+
+  function fromEvent(e) {
+    if (!e || !e.detail) return;
+    render(e.detail.fields, e.detail.id);
+  }
+
+  document.addEventListener("update-record", fromEvent);
+
+  var seen = {};
+  function listenTo(blockId) {
+    if (!blockId || seen[blockId]) return;
+    seen[blockId] = true;
+    document.addEventListener("get-record-" + blockId, fromEvent);
+  }
+
+  (widget.getAttribute("data-block-id") || "").split(",").forEach(function (id) {
+    listenTo(id.trim());
+  });
+
+  // Softr names the event after the block, and the block id is not knowable
+  // from here. Watch what the page actually dispatches instead of guessing:
+  // the wrapper is additive and always calls through.
+  try {
+    var native = document.dispatchEvent;
+    var patched = function (e) {
+      if (e && typeof e.type === "string" && e.type.indexOf("get-record-") === 0) {
+        try { fromEvent(e); } catch (err) { /* never break the host page */ }
+      }
+      return native.apply(this, arguments);
+    };
+    document.dispatchEvent = patched;
+    // Only ever undo our own wrapper: another script may have layered one on
+    // top in the meantime, and clobbering that would break the host page.
+    unhook = function () {
+      if (document.dispatchEvent === patched) document.dispatchEvent = native;
+    };
+  } catch (err) { /* leave the other paths to it */ }
+
+  // Blocks added to the page after this ran, so their event is still to come.
+  // The wrapper above already catches those; this is the belt to its braces,
+  // and neither can recover an event dispatched before this script executed.
+  var obs = new MutationObserver(function () {
+    if (done) { obs.disconnect(); return; }
+    var nodes = document.querySelectorAll('[id^="list-details"],[id^="list-detail"]');
+    for (var i = 0; i < nodes.length; i++) listenTo(nodes[i].id);
+  });
+  obs.observe(document.documentElement, { childList: true, subtree: true });
+  setTimeout(function () { obs.disconnect(); }, 15000);
+})();
+</script>
