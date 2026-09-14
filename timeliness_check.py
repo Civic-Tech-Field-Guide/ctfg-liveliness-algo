@@ -431,6 +431,29 @@ class _LimitedResponse:
         return self.content.decode(self._encoding, errors="replace")
 
 
+_PAGE_CACHE = {}
+
+
+def get_page_cached(url):
+    """
+    (html, headers) for a URL, fetched at most once per record.
+
+    The homepage is now read twice — once for social links, once for the dates
+    the page states about itself — and neither is worth a second download.
+    Cleared per record by compute_liveliness so a 200-record batch does not hold
+    200 pages of up to MAX_FETCH_BYTES each.
+    """
+    if url in _PAGE_CACHE:
+        return _PAGE_CACHE[url]
+    try:
+        r = get_limited(url)
+        val = (r.text, dict(r.headers)) if r.status_code == 200 else (None, None)
+    except Exception:
+        val = (None, None)
+    _PAGE_CACHE[url] = val
+    return val
+
+
 def get_limited(url, timeout=10, headers=None):
     """GET that stops reading at MAX_FETCH_BYTES or FETCH_DEADLINE_S of
     wall-clock time, whichever comes first. Raises like requests.get.
@@ -1073,11 +1096,11 @@ def discover_social_links(website_url):
     if not website_url:
         return []
     try:
-        r = get_limited(website_url)
-        if r.status_code != 200:
+        html, _ = get_page_cached(website_url)
+        if not html:
             return []
         parser = _LinkExtractor()
-        parser.feed(r.text)
+        parser.feed(html)
         found = {}
         for href, _ in parser.links:
             if not href.startswith("http"):
@@ -1304,6 +1327,7 @@ RECENT_LAUNCH_SCORE = 60    # lands in the "Likely Active" band
 # reduced bonus: enough to keep the listing off the dead-site penalty, not enough
 # to carry stale work upward. Abre Alcaldias read 100/Active off a 698-day-old
 # blog post plus a live site, because 55 + 15 lands exactly on the Active line.
+COPYRIGHT_FRESH_BONUS     = 10   # footer copyright naming this year or last
 WEBSITE_ALIVE_BONUS       = 15
 WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
@@ -1413,6 +1437,201 @@ def recently_launched(rec, now):
     return (now - dt).days <= RECENT_LAUNCH_DAYS
 
 
+# ── What the page says about itself ───────────────────────────────────────────
+#
+# Until now the only dated signals were GitHub, a blog feed and social posts, so
+# a project with a plain website could not produce a date however plainly the
+# page stated one. check_website() fetched the page and kept only alive/dead.
+#
+# _decode_entities, _clean, meta_content and readable_page are ports of
+# CTFG-curator lib/page-fetch.mjs, which already solved the two awkward parts:
+# reading a <meta> whichever order its attributes come in, and isolating
+# <footer>/<address> from the body. The footer split is what makes a copyright
+# line readable — as CTFG-curator's own project-status.mjs puts it, "a year
+# anywhere in the page text is the copyright line as often as it is the date of
+# the thing", so the year is only trusted where copyright lines actually live.
+
+_NAMED_ENTITIES = {"lt": "<", "gt": ">", "quot": '"', "apos": "'", "nbsp": " ",
+                   "copy": "\u00a9", "reg": "\u00ae", "mdash": "\u2014",
+                   "ndash": "\u2013", "rsquo": "\u2019", "lsquo": "\u2018"}
+
+
+def _decode_entities(s):
+    s = str(s or "")
+    s = re.sub(r"&#x([0-9a-fA-F]+);", lambda m: chr(int(m.group(1), 16)), s)
+    s = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), s)
+    for name, ch in _NAMED_ENTITIES.items():
+        s = s.replace("&%s;" % name, ch)
+    return s.replace("&amp;", "&")   # last, so &amp;#39; does not double-decode
+
+
+def _clean(s):
+    return re.sub(r"\s+", " ", _decode_entities(re.sub(r"<[^>]+>", " ", str(s or "")))).strip()
+
+
+def meta_content(html, prop):
+    """A <meta> content value by property or name, either attribute order."""
+    for pattern in (r'<meta[^>]+(?:property|name)=["\']%s["\'][^>]+content=["\']([^"\']*)["\']',
+                    r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+(?:property|name)=["\']%s["\']'):
+        m = re.search(pattern % re.escape(prop), html, re.I)
+        if m and m.group(1).strip():
+            return _decode_entities(m.group(1).strip())
+    return None
+
+
+def readable_page(html, text_cap=12000, footer_cap=800):
+    """Strip a page to its own words, keeping the footer separate."""
+    stripped = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+    stripped = re.sub(r"<style[\s\S]*?</style>", " ", stripped, flags=re.I)
+    stripped = re.sub(r"<!--[\s\S]*?-->", " ", stripped)
+    stripped = re.sub(r"<nav\b[\s\S]*?</nav>", " ", stripped, flags=re.I)
+    footer = "\n".join(
+        _clean(m.group(1))
+        for m in re.finditer(r"<(?:footer|address)[^>]*>([\s\S]*?)</(?:footer|address)>",
+                             stripped, re.I)
+    )[:footer_cap]
+    return {"footer": footer or None, "text": _clean(stripped)[:text_cap]}
+
+
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July",
+     "August", "September", "October", "November", "December"], 1)}
+for _full, _i in list(_MONTHS.items()):
+    _MONTHS[_full[:3]] = _i
+
+
+def _parse_date_loose(raw, now):
+    """
+    A date from any of the shapes a page states one in, or None.
+
+    Rejects anything in the future or before 2000: a page carrying a 1970 epoch
+    stamp or a 2031 copyright is stating a template default, not activity.
+    """
+    s = _clean(raw)[:60]
+    if not s:
+        return None
+    dt = None
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)                       # ISO
+    if m:
+        y, mo, d = (int(g) for g in m.groups())
+    else:
+        m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})", s)  # 20 March 2026
+        if m and m.group(2).lower() in _MONTHS:
+            d, mo, y = int(m.group(1)), _MONTHS[m.group(2).lower()], int(m.group(3))
+        else:
+            m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", s)  # March 20, 2026
+            if m and m.group(1).lower() in _MONTHS:
+                mo, d, y = _MONTHS[m.group(1).lower()], int(m.group(2)), int(m.group(3))
+            else:
+                return None
+    try:
+        dt = datetime(y, mo, d, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    if dt > now + timedelta(days=1) or dt.year < 2000:
+        return None
+    return dt
+
+
+# Where a page states its own date, best evidence first.
+_META_DATE_PROPS = ["article:modified_time", "og:updated_time", "article:published_time",
+                    "dateModified", "datePublished", "last-modified", "DC.date", "date"]
+
+# The capture is a lookahead so the match itself ends at the keyword. A page
+# that prints "Published: 6 January 2026 Last updated: 20 March 2026" as two
+# stacked lines collapses to one line of text once the tags are stripped, and a
+# consuming capture swallowed the second label with the first date — reporting
+# the older of the two as the page's date.
+_TEXT_DATE_RE = re.compile(
+    r"(last\s+updated|last\s+modified|updated\s+on|published|posted)\s*[:\-–]?\s*"
+    r"(?=([0-9A-Za-z][^<\n|·•]{5,24}))", re.I)
+
+
+def page_date_signals(html, headers, now):
+    """Every date the page states about itself, as (datetime, label) pairs."""
+    out = []
+
+    for block in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>',
+                            html, re.I)[:5]:
+        try:
+            data = json.loads(block.strip())
+        except Exception:
+            continue
+        stack, seen = [data], 0
+        while stack and seen < 200:
+            node = stack.pop()
+            seen += 1
+            if isinstance(node, list):
+                stack.extend(node)
+            elif isinstance(node, dict):
+                for key in ("dateModified", "datePublished"):
+                    dt = _parse_date_loose(node.get(key), now)
+                    if dt:
+                        out.append((dt, "the page's own %s" % key))
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+
+    for prop in _META_DATE_PROPS:
+        dt = _parse_date_loose(meta_content(html, prop), now)
+        if dt:
+            out.append((dt, "a %s tag on the page" % prop))
+
+    for raw in re.findall(r'<time[^>]+datetime=["\']([^"\']+)["\']', html, re.I)[:20]:
+        dt = _parse_date_loose(raw, now)
+        if dt:
+            out.append((dt, "a <time> element on the page"))
+
+    page = readable_page(html)
+    for m in _TEXT_DATE_RE.finditer(page["text"][:4000]):
+        dt = _parse_date_loose(m.group(2), now)
+        if dt:
+            out.append((dt, 'the page\'s "%s" line' % _clean(m.group(1)).lower()))
+
+    dt = _parse_date_loose((headers or {}).get("Last-Modified"), now)
+    if dt:
+        out.append((dt, "the server's Last-Modified header"))
+
+    return out
+
+
+def footer_copyright_year(html):
+    """
+    The newest year in a copyright line in the footer, or None.
+
+    Only the footer, and only next to a copyright mark. A bare year in body text
+    is as likely to be a citation as a sign of life, and this is weak enough
+    evidence already.
+    """
+    footer = (readable_page(html) or {}).get("footer")
+    if not footer:
+        return None
+    years = []
+    for m in re.finditer(r"(?:©|\(c\)|copyright)[^0-9]{0,20}((?:19|20)\d{2})"
+                         r"(?:\s*[-–—]\s*((?:19|20)\d{2}))?", footer, re.I):
+        years.extend(int(g) for g in m.groups() if g)
+    return max(years) if years else None
+
+
+def page_recency_score(dt, now):
+    """
+    Score 0–70 for a date the project's own page states about itself.
+
+    Under recency_base_score's 85 because a page date is easier to be wrong
+    about: a CMS stamps dateModified when a template changes, and a hand-written
+    "last updated" line goes stale in place. Over social_recency_score's 55
+    because it is the project talking about itself on its own site.
+    """
+    if dt is None:
+        return 0
+    age_days = max(0, (now - dt).days)
+    if age_days <= 90:   return 70
+    if age_days <= 180:  return 65
+    if age_days <= 365:  return 55
+    if age_days <= 730:  return 40
+    if age_days <= 1095: return 25
+    if age_days <= 1825: return 10
+    return 3
+
+
 def website_alive_bonus(best_date, now):
     """Points a reachable website earns, given the newest dated signal."""
     if best_date is None:
@@ -1481,6 +1700,7 @@ def compute_liveliness(rec):
     fields = rec.get("fields", {})
     name   = fields.get(F_NAME, rec["id"])
     now    = datetime.now(timezone.utc)
+    _PAGE_CACHE.clear()
 
     print(f"\n  [{name}]")
 
@@ -1613,6 +1833,21 @@ def compute_liveliness(rec):
     for dt, platform in social_dated:
         candidates.append((social_recency_score(dt, now), dt, f"{platform} post"))
 
+    # What the project's own page says about itself. The page was already
+    # downloaded for the social-link scrape, so this costs no extra request.
+    page_copyright_year = None
+    if website_url and website_alive is True:
+        page_html, page_headers = get_page_cached(website_url)
+        if page_html:
+            page_signals = page_date_signals(page_html, page_headers, now)
+            if page_signals:
+                pdt, plabel = max(page_signals, key=lambda c: c[0])
+                candidates.append((page_recency_score(pdt, now), pdt, plabel))
+                print(f"    page     → {plabel}: {pdt:%Y-%m-%d}")
+            page_copyright_year = footer_copyright_year(page_html)
+            if page_copyright_year:
+                print(f"    page     → footer copyright {page_copyright_year}")
+
     best_score = max((c[0] for c in candidates), default=0)
     best_date  = max((c[1] for c in candidates), default=None)
 
@@ -1636,7 +1871,8 @@ def compute_liveliness(rec):
             why.append("The GitHub repository is archived, so however recent its last "
                        "activity is, it counts for at most 15")
     else:
-        why.append("No dated activity found in code, feeds or social posts (0)")
+        why.append("No dated activity found in code, feeds, social posts or on the "
+                   "project's own page (0)")
 
     # Issue tracker responsiveness. A tiebreaker on the dated signals above,
     # never a base score, so it is applied after the winner is chosen. Skipped
@@ -1688,6 +1924,19 @@ def compute_liveliness(rec):
             f"{'' if accessible_count == 1 else 's'} reachable",
             social_bonus, score - before))
 
+    # A footer copyright naming this year or last. Weak on its own — plenty of
+    # templates render the year server-side or in JS on a site nobody has touched
+    # in years — so it is worth a little and never a date. It does count as
+    # evidence, though, which is enough to keep the listing out of Unknown: a
+    # page that is being rebuilt each year is not a page nothing is known about.
+    fresh_copyright = (page_copyright_year is not None
+                       and page_copyright_year >= now.year - 1)
+    if fresh_copyright:
+        before = score
+        score  = min(score + COPYRIGHT_FRESH_BONUS, 100)
+        why.append(_adjustment("Footer copyright reads %d" % page_copyright_year,
+                               COPYRIGHT_FRESH_BONUS, score - before))
+
     # A recent launch is evidence in its own right, and the only positive
     # evidence available for a listing with nothing dated anywhere. Applied as a
     # floor so a measured score above it is left alone.
@@ -1716,6 +1965,7 @@ def compute_liveliness(rec):
     # launch all carry real evidence, so none of them land here.
     undated = (best_date is None
                and not recent_launch
+               and not fresh_copyright
                and not is_archived
                and website_alive is not False)
 
