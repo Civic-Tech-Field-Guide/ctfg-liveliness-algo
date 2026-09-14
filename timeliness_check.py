@@ -1328,6 +1328,9 @@ RECENT_LAUNCH_SCORE = 60    # lands in the "Likely Active" band
 # to carry stale work upward. Abre Alcaldias read 100/Active off a 698-day-old
 # blog post plus a live site, because 55 + 15 lands exactly on the Active line.
 COPYRIGHT_FRESH_BONUS     = 10   # footer copyright naming this year or last
+# Below this, a Last-Modified header is the server's clock rather than the age
+# of anything on the page.
+LAST_MODIFIED_MIN_AGE_DAYS = 2
 WEBSITE_ALIVE_BONUS       = 15
 WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
@@ -1573,12 +1576,12 @@ def page_date_signals(html, headers, now):
     for prop in _META_DATE_PROPS:
         dt = _parse_date_loose(meta_content(html, prop), now)
         if dt:
-            out.append((dt, "a %s tag on the page" % prop))
+            out.append((dt, "the page's %s tag" % prop))
 
     for raw in re.findall(r'<time[^>]+datetime=["\']([^"\']+)["\']', html, re.I)[:20]:
         dt = _parse_date_loose(raw, now)
         if dt:
-            out.append((dt, "a <time> element on the page"))
+            out.append((dt, "a date marked up on the page"))
 
     page = readable_page(html)
     for m in _TEXT_DATE_RE.finditer(page["text"][:4000]):
@@ -1586,8 +1589,14 @@ def page_date_signals(html, headers, now):
         if dt:
             out.append((dt, 'the page\'s "%s" line' % _clean(m.group(1)).lower()))
 
+    # Last-Modified, but only when it is not simply the server's clock. A page
+    # generated per request carries the time of the request, so ontodia.org
+    # answered with the current second and scored as though the project had been
+    # worked on that day. A real static mtime is days or months old; a stamp
+    # inside LAST_MODIFIED_MIN_AGE_DAYS says nothing about the content, so it is
+    # dropped rather than believed.
     dt = _parse_date_loose((headers or {}).get("Last-Modified"), now)
-    if dt:
+    if dt and (now - dt).days >= LAST_MODIFIED_MIN_AGE_DAYS:
         out.append((dt, "the server's Last-Modified header"))
 
     return out
