@@ -79,7 +79,7 @@ buckets = {
     "Recovered — was floored at 25, now 70 or above": [],
     "Scored 60 on a stale or missing date — check the launch rule": [],
     "Cleared to Unknown — nothing datable found anywhere": [],
-    "Scored on the page alone — no repo, feed or social signal": [],
+    "Score leans on a page signal — worth checking what it rests on": [],
 }
 
 for r in records:
@@ -90,8 +90,11 @@ for r in records:
         buckets["Scored 60 on a stale or missing date — check the launch rule"].append((r, a))
     if r["score"] == "None" or r["activity"] == "Unknown":
         buckets["Cleared to Unknown — nothing datable found anywhere"].append((r, a))
+    # The log does not say whether a repo or feed also contributed, so this is
+    # "a page signal was found and the record scored", not "the page was the
+    # only evidence". Labelled accordingly rather than overclaiming.
     if r["page"] and n is not None and n > 0:
-        buckets["Scored on the page alone — no repo, feed or social signal"].append((r, a))
+        buckets["Score leans on a page signal — worth checking what it rests on"].append((r, a))
 
 def fetch_fields(ids):
     """
