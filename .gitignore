@@ -4,4 +4,5 @@ __pycache__/
 .DS_Store
 .venv/
 backfill.log
-.backfill-state
+.backfill-state*
+.redo-state*
