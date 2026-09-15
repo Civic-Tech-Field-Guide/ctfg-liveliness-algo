@@ -2194,6 +2194,16 @@ def compute_liveliness(rec):
     # evidence available for a listing with nothing dated anywhere. Applied as a
     # floor so a measured score above it is left alone.
     recent_launch = recently_launched(rec, now)
+    # A launch flag cannot outvote the site being gone. Added to the directory in
+    # March says nothing about a domain that stopped answering in August, and an
+    # address that now resolves to an archive snapshot has already been capped
+    # for exactly that reason — the floor would undo the cap.
+    if recent_launch and (website_alive is False or is_archived):
+        why.append("Added to the directory in the last nine months and marked as a "
+                   "launch, but %s, which is the better evidence"
+                   % ("its address is an archive snapshot" if is_archived
+                      else "its website no longer answers"))
+        recent_launch = False
     if recent_launch:
         before = score
         score  = max(score, RECENT_LAUNCH_SCORE)
