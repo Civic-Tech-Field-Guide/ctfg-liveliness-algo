@@ -77,7 +77,7 @@ def num(r):
 
 buckets = {
     "Recovered — was floored at 25, now 70 or above": [],
-    "Scored 60 on a stale or missing date — check the launch rule": [],
+    "Scored around the launch floor with a stale or missing date": [],
     "Cleared to Unknown — nothing datable found anywhere": [],
     "Score leans on a page signal — worth checking what it rests on": [],
 }
@@ -87,7 +87,7 @@ for r in records:
     if n is not None and n >= 70:
         buckets["Recovered — was floored at 25, now 70 or above"].append((r, a))
     if n is not None and abs(n - 60) < 0.01 and (a is None or a > 365):
-        buckets["Scored 60 on a stale or missing date — check the launch rule"].append((r, a))
+        buckets["Scored around the launch floor with a stale or missing date"].append((r, a))
     if r["score"] == "None" or r["activity"] == "Unknown":
         buckets["Cleared to Unknown — nothing datable found anywhere"].append((r, a))
     # The log does not say whether a repo or feed also contributed, so this is
@@ -115,7 +115,8 @@ def fetch_fields(ids):
         chunk = ids[i:i + 50]
         formula = "OR(%s)" % ",".join('RECORD_ID()="%s"' % r for r in chunk)
         params = [("filterByFormula", formula), ("pageSize", "100"),
-                  ("fields[]", "Website URL"), ("fields[]", "Project name")]
+                  ("fields[]", "Website URL"), ("fields[]", "Project name"),
+                  ("fields[]", "Score breakdown")]
         url = "https://api.airtable.com/v0/%s/%s?%s" % (
             BASE, urllib.parse.quote(TABLE), urllib.parse.urlencode(params))
         req = urllib.request.Request(url, headers={"Authorization": "Bearer " + pat})
@@ -127,7 +128,8 @@ def fetch_fields(ids):
             return out
         for rec in data.get("records", []):
             f = rec.get("fields") or {}
-            out[rec["id"]] = {"name": f.get("Project name"), "site": f.get("Website URL")}
+            out[rec["id"]] = {"name": f.get("Project name"), "site": f.get("Website URL"),
+                              "why": (f.get("Score breakdown") or "").split("\n")[0]}
     return out
 
 
@@ -146,6 +148,12 @@ for title, rows in buckets.items():
         print("  %-42s %-6s %-16s %s" % (name[:42], r["score"], r["activity"], age))
         if r["page"]:
             print("       via %s" % r["page"][:88])
+        # The stored breakdown names the signal the score actually rests on.
+        # Reading the cause off the number instead put a record down to the
+        # launch rule three times when it was the recency curve, so the reason
+        # is quoted rather than inferred.
+        if info.get("why"):
+            print("       why     %s" % info["why"][:96])
         if info.get("site"):
             print("       site    %s" % info["site"])
         print("       profile %s" % (PROFILE % r["id"]))
