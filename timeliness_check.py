@@ -1557,8 +1557,14 @@ _TEXT_DATE_RE = re.compile(
     r"(?=([0-9A-Za-z][^<\n|·•]{5,24}))", re.I)
 
 
-def page_date_signals(html, headers, now):
-    """Every date the page states about itself, as (datetime, label) pairs."""
+def page_date_signals(html, headers, now, text=None):
+    """
+    Every date the page states about itself, as (datetime, label) pairs.
+
+    `text` replaces the page's own words when they only exist after rendering.
+    The markup sources above it still read the static html, which is where
+    meta tags and ld+json live whether or not the body was painted by script.
+    """
     out = []
 
     for block in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>',
@@ -1590,8 +1596,8 @@ def page_date_signals(html, headers, now):
         if dt:
             out.append((dt, "a date marked up on the page"))
 
-    page = readable_page(html)
-    for m in _TEXT_DATE_RE.finditer(page["text"][:4000]):
+    words = text if text is not None else readable_page(html)["text"]
+    for m in _TEXT_DATE_RE.finditer(words[:4000]):
         dt = _parse_date_loose(m.group(2), now)
         if dt:
             out.append((dt, 'the page\'s "%s" line' % _clean(m.group(1)).lower()))
@@ -1625,6 +1631,125 @@ def footer_copyright_year(html):
                          r"(?:\s*[-–—]\s*((?:19|20)\d{2}))?", footer, re.I):
         years.extend(int(g) for g in m.groups() if g)
     return max(years) if years else None
+
+
+# ── Reading a page that builds itself in the browser ──────────────────────────
+#
+# Roughly a tenth of reachable project sites serve a shell to a plain fetch and
+# paint everything that matters after the JavaScript runs — including, on one
+# consultation, the notice that it had closed months earlier. Those pages are
+# re-read through a real browser, and only those: rendering every page would
+# multiply the run for no gain on the nine in ten that are already readable.
+#
+# Ported from CTFG-curator server.js (renderPageText / maybeRenderThinPage),
+# including the resource blocking, the bounded networkidle wait and the settle
+# afterwards. Everything here fails soft: no Playwright, no browser, a crash
+# mid-render — all return None and leave the listing recorded as unread, which
+# is what it was before this existed.
+
+RENDER_THIN_PAGES = os.environ.get("RENDER_THIN_PAGES", "1") != "0"
+RENDER_GOTO_MS    = 15_000
+RENDER_SETTLE_MS  = 2_500
+RENDER_TEXT_CAP   = 12_000
+
+_BROWSER = None
+_BROWSER_FAILED = False
+_PLAYWRIGHT = None
+
+# Matched against the HOST, never the whole URL. A path-wide match blocked a
+# first-party bundle chunk that happened to be named analytics.js, and the app
+# it belonged to then rendered nothing at all — a page that reads as empty for
+# the same reason a dead site does.
+_RENDER_BLOCKED_HOSTS = re.compile(
+    r"(?:^|\.)(?:googletagmanager\.com|google-analytics\.com|analytics\.google\.com|"
+    r"hotjar\.com|hotjar\.io|intercom\.io|intercomcdn\.com|hubspot\.com|hs-scripts\.com|"
+    r"segment\.io|segment\.com|doubleclick\.net|facebook\.net|mixpanel\.com|"
+    r"plausible\.io|matomo\.cloud|clarity\.ms|fullstory\.com)$", re.I)
+
+
+def _render_should_block(request):
+    """True for a request that cannot affect the page's words."""
+    if request.resource_type in ("media", "font", "image"):
+        return True
+    host = (urlparse(request.url).hostname or "").lower()
+    return bool(_RENDER_BLOCKED_HOSTS.search(host))
+
+
+def _get_browser():
+    """One chromium for the whole run, or None if it cannot be had."""
+    global _BROWSER, _BROWSER_FAILED, _PLAYWRIGHT
+    if _BROWSER is not None or _BROWSER_FAILED:
+        return _BROWSER
+    try:
+        from playwright.sync_api import sync_playwright
+        _PLAYWRIGHT = sync_playwright().start()
+        _BROWSER = _PLAYWRIGHT.chromium.launch(args=["--no-sandbox", "--disable-dev-shm-usage"])
+    except Exception as e:
+        _BROWSER_FAILED = True
+        print(f"    render   → unavailable ({type(e).__name__}); thin pages stay unread")
+    return _BROWSER
+
+
+def close_browser():
+    global _BROWSER, _PLAYWRIGHT
+    try:
+        if _BROWSER:
+            _BROWSER.close()
+        if _PLAYWRIGHT:
+            _PLAYWRIGHT.stop()
+    except Exception:
+        pass
+    _BROWSER, _PLAYWRIGHT = None, None
+
+
+def render_page_text(url):
+    """The page's visible text once its JavaScript has run, or None."""
+    if not RENDER_THIN_PAGES:
+        return None
+    browser = _get_browser()
+    if browser is None:
+        return None
+    page = None
+    try:
+        page = browser.new_page()
+
+        def _route(route):
+            # Both calls have to swallow their own errors. A route that has
+            # already been handled, or one whose request died with the frame,
+            # raises here, and an exception escaping this handler takes the
+            # whole navigation down with it — the page then renders nothing at
+            # all, which looks exactly like a site with no content.
+            try:
+                if _render_should_block(route.request):
+                    route.abort()
+                else:
+                    route.continue_()
+            except Exception:
+                pass
+
+        page.route("**/*", _route)
+        # networkidle can hang on a page holding a socket open, so the wait is
+        # bounded and a timeout reads whatever painted rather than failing.
+        try:
+            page.goto(url, timeout=RENDER_GOTO_MS, wait_until="networkidle")
+        except Exception as e:
+            if "imeout" not in str(e):
+                raise
+        # A short settle lets late client-side renders paint. Deliberately not
+        # cut short on a length threshold: nav chrome and a cookie banner clear
+        # any low bar well before the content does.
+        page.wait_for_timeout(RENDER_SETTLE_MS)
+        text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        return re.sub(r"\s+", " ", text).strip()[:RENDER_TEXT_CAP] or None
+    except Exception as e:
+        print(f"    render   → failed ({type(e).__name__})")
+        return None
+    finally:
+        if page:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 # ── Pages that say the thing is over ──────────────────────────────────────────
@@ -1668,7 +1793,7 @@ _CLOSURE_DATE_RE = re.compile(r"(?:closed|ended|closes|ends|deadline)[^.]{0,40}?
                               r"(?:\d{4}-\d{2}-\d{2}))", re.I)
 
 
-def page_says_closed(html, now):
+def page_says_closed(html, now, text=None):
     """
     (closed, phrase) when the page says the thing it describes has finished.
 
@@ -1676,7 +1801,7 @@ def page_says_closed(html, now):
     notice is put at the top, while further down "applications closed" is as
     likely to be describing a past round in a history section.
     """
-    text = readable_page(html)["text"][:3000]
+    text = (text if text is not None else readable_page(html)["text"])[:3000]
     if not text:
         return False, None
     for pattern in _CLOSURE_PATTERNS:
@@ -1933,16 +2058,28 @@ def compute_liveliness(rec):
             # as its own fact rather than left to look like an absence.
             readable = readable_page(page_html)["text"]
             page_unreadable = len(readable) < MIN_READABLE_PAGE_CHARS
-            page_signals = page_date_signals(page_html, page_headers, now)
+
+            # A shell is worth a second look through a browser, where the words
+            # actually exist. Only a shell: the nine in ten pages that already
+            # read fine would pay for a render that told us nothing new.
+            rendered = None
+            if page_unreadable and not is_archived:
+                print(f"    page     → only {len(readable)} chars of text; rendering")
+                rendered = render_page_text(website_url)
+                if rendered and len(rendered) >= MIN_READABLE_PAGE_CHARS:
+                    page_unreadable = False
+                    print(f"    render   → {len(rendered)} chars of text")
+
+            page_signals = page_date_signals(page_html, page_headers, now, text=rendered)
             if page_signals:
                 pdt, plabel = max(page_signals, key=lambda c: c[0])
                 candidates.append((page_recency_score(pdt, now), pdt, plabel))
                 print(f"    page     → {plabel}: {pdt:%Y-%m-%d}")
-            page_closed, page_closed_phrase = page_says_closed(page_html, now)
+            page_closed, page_closed_phrase = page_says_closed(page_html, now, text=rendered)
             if page_closed:
                 print(f"    page     → says it has closed: {page_closed_phrase!r}")
             if page_unreadable:
-                print(f"    page     → only {len(readable)} chars of text; app shell, not read")
+                print(f"    page     → still unread after rendering")
             else:
                 page_copyright_year = footer_copyright_year(page_html)
                 if page_copyright_year:
@@ -2278,4 +2415,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        close_browser()

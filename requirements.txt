@@ -5,3 +5,4 @@ idna==3.19
 requests==2.34.2
 sgmllib3k==1.0.0
 urllib3==2.7.0
+playwright==1.62.0
