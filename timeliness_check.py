@@ -1335,6 +1335,9 @@ LAST_MODIFIED_MIN_AGE_DAYS = 2
 # JavaScript shell rather than a page. CTFG-curator uses the same threshold in
 # maybeRenderThinPage() before it re-reads the page through a browser.
 MIN_READABLE_PAGE_CHARS = 200
+# What a listing scores once its own page says it has finished. Matches the cap
+# an archive snapshot gets: both are the page telling us the thing is over.
+CLOSED_CAP = 10
 WEBSITE_ALIVE_BONUS       = 15
 WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
@@ -1624,6 +1627,74 @@ def footer_copyright_year(html):
     return max(years) if years else None
 
 
+# ── Pages that say the thing is over ──────────────────────────────────────────
+#
+# A date is not automatically a sign of life. "This questionnaire closed on
+# July 2, 2026" is the page saying it has finished, and read as a recency signal
+# it would score the consultation as freshly active — the opposite of what it
+# says. Same shape as CTFG-curator's isPastEvent(), which rules that an event
+# naming a year now past has happened.
+#
+# The wording has to carry both a subject that can close and a closing verb.
+# "Closed" alone is far too common to trust: closed source, closed beta, closed
+# captions, closed loop, a closed Facebook group. So the subject is named
+# explicitly, and the generic patterns underneath require the sentence to be
+# about the thing itself having ended.
+
+_CLOSED_SUBJECTS = (r"questionnaire|survey|consultation|call for [a-z ]{3,20}|application[s]?|"
+                    r"submission[s]?|registration|nomination[s]?|entries|voting|poll|"
+                    r"programme|program|project|pilot|competition|contest|challenge|fund")
+
+_CLOSURE_PATTERNS = [
+    # "This questionnaire closed on July 2, 2026" / "applications closed 1 March 2025"
+    re.compile(r"\b(?:this |the )?(?:%s)\s+(?:has |have |was |were |is |are )?"
+               r"(?:now )?(?:closed|ended|finished|concluded)\b" % _CLOSED_SUBJECTS, re.I),
+    # "no longer accepting submissions", "we are no longer taking applications"
+    re.compile(r"\bno longer (?:accepting|taking|open to|receiving)\b", re.I),
+    # "the deadline has passed", "submission deadline passed"
+    re.compile(r"\bdeadline (?:has )?(?:passed|expired)\b", re.I),
+    # "this project has ended", "the programme is now closed"
+    re.compile(r"\bthis (?:project|programme|program|pilot|initiative|campaign)\s+"
+               r"(?:has |had )?(?:ended|closed|finished|concluded|wound down)\b", re.I),
+    # "applications are now closed" written the other way round
+    re.compile(r"\b(?:%s)\s+(?:are|is)\s+(?:now\s+)?closed\b" % _CLOSED_SUBJECTS, re.I),
+]
+
+# A closure sentence often names the date it closed. Read it only to confirm the
+# closing is in the past; a date still ahead means the thing is open until then.
+_CLOSURE_DATE_RE = re.compile(r"(?:closed|ended|closes|ends|deadline)[^.]{0,40}?"
+                              r"((?:\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})|"
+                              r"(?:[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})|"
+                              r"(?:\d{4}-\d{2}-\d{2}))", re.I)
+
+
+def page_says_closed(html, now):
+    """
+    (closed, phrase) when the page says the thing it describes has finished.
+
+    Only the page's own words, and only the first stretch of them: a closure
+    notice is put at the top, while further down "applications closed" is as
+    likely to be describing a past round in a history section.
+    """
+    text = readable_page(html)["text"][:3000]
+    if not text:
+        return False, None
+    for pattern in _CLOSURE_PATTERNS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        # If the sentence names a date, believe the closure only once that date
+        # has actually arrived.
+        window = text[m.start():m.start() + 160]
+        dm = _CLOSURE_DATE_RE.search(window)
+        if dm:
+            dt = _parse_date_loose(dm.group(1), now)
+            if dt and dt > now:
+                continue
+        return True, re.sub(r"\s+", " ", m.group(0)).strip()[:80]
+    return False, None
+
+
 def page_recency_score(dt, now):
     """
     Score 0–70 for a date the project's own page states about itself.
@@ -1850,6 +1921,7 @@ def compute_liveliness(rec):
     # downloaded for the social-link scrape, so this costs no extra request.
     page_copyright_year = None
     page_unreadable = False
+    page_closed, page_closed_phrase = False, None
     if website_url and website_alive is True:
         page_html, page_headers = get_page_cached(website_url)
         if page_html:
@@ -1866,6 +1938,9 @@ def compute_liveliness(rec):
                 pdt, plabel = max(page_signals, key=lambda c: c[0])
                 candidates.append((page_recency_score(pdt, now), pdt, plabel))
                 print(f"    page     → {plabel}: {pdt:%Y-%m-%d}")
+            page_closed, page_closed_phrase = page_says_closed(page_html, now)
+            if page_closed:
+                print(f"    page     → says it has closed: {page_closed_phrase!r}")
             if page_unreadable:
                 print(f"    page     → only {len(readable)} chars of text; app shell, not read")
             else:
@@ -1983,6 +2058,17 @@ def compute_liveliness(rec):
                        "launch, but the signals found already score higher than that on "
                        "their own")
 
+    # The page saying it has finished outranks everything above it, including a
+    # recent launch: something added to the directory in March and closed in July
+    # was both. Applied last so nothing can lift it back up.
+    if page_closed:
+        before = score
+        score  = min(score, CLOSED_CAP)
+        why.append("The project's own page says it has finished (\"%s\"), so it is not "
+                   "scored on how recently that page changed%s"
+                   % (page_closed_phrase,
+                      "" if score == before else " (capped at %g)" % CLOSED_CAP))
+
     # Fully unknown: nothing could be checked at all
     no_signals = (best_date is None and website_alive is None and accessible_count == 0)
 
@@ -1993,6 +2079,7 @@ def compute_liveliness(rec):
     # inactive". A site that failed to respond, an archive snapshot and a recent
     # launch all carry real evidence, so none of them land here.
     undated = (best_date is None
+               and not page_closed
                and not recent_launch
                and not fresh_copyright
                and not is_archived
