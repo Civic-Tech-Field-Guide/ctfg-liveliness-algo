@@ -36,6 +36,7 @@ now costs 4 to 6 calls, so a batch of 200 can need 1,200. With `GITHUB_TOKEN` se
 | GitHub | Last push, latest release, last commit, maintainer activity on issues and PRs, how much of the recent issue traffic got resolved, and whether the repo is archived. A profile URL is resolved to that account's most recently pushed repo. |
 | Blog | Latest entry in an RSS or Atom feed, either from the Airtable field or discovered on the homepage. |
 | Social | Last post date for YouTube, Bluesky, Medium, Reddit, Substack and Mastodon. Twitter/X, LinkedIn, Facebook and Instagram are checked for reachability only, since neither exposes a post date. Links come from the Airtable Links table and from scraping the homepage. |
+| The page itself | What the site says about its own age: schema.org `dateModified` and `datePublished`, the usual meta tags, `time` elements, and visible lines such as "Last updated: 20 March 2026". A footer copyright naming this year or last is read separately as weak evidence that the site is being kept up. A page that says the thing has closed is read as an ending rather than a date. |
 
 Maintainer activity on issues counts merged PRs, anything opened by an owner, member or
 collaborator, and an outsider's issue closed by somebody other than its author. An outsider
@@ -53,6 +54,23 @@ The window matters. An all-time ratio of closed to open issues never decays, so 
 closed 900 issues between 2015 and 2020 and nothing since still reads as well maintained, which
 is the opposite of what this tool is for.
 
+Until September 2026 the site was fetched only to see whether it answered, and the page
+itself was thrown away. A project whose homepage plainly stated when it was last updated
+produced no date at all, and scored as though nothing had been found. Across thirty sampled
+listings, 52% of reachable sites state a date that can now be read.
+
+The server's `Last-Modified` header is believed only when it is at least two days old. A page
+built fresh for each request answers with the time of the request, so one listing reached the
+top of the scale on a header that echoed the current second. A real file timestamp is days or
+months old; a server clock never is.
+
+About one reachable site in ten serves a shell to a plain fetch and paints its text afterwards
+in the browser. Those are re-read through a headless browser, and only those. One listing's
+page carried twenty-seven characters of static text, and the notice that it had stopped taking
+reports existed only once its script had run. Where a page cannot be read even after that, the
+listing is recorded as unread rather than as a page that said nothing, and its footer
+copyright does not count: a shell's footer is not the project's.
+
 Any date more than a day in the future is discarded. Commit dates, RSS pubDates and social
 post dates are all set by whoever published them, so a wrong clock or a deliberate stamp can
 otherwise make a stale project score full marks forever.
@@ -60,7 +78,13 @@ otherwise make a stale project score full marks forever.
 ## Scoring
 
 A GitHub or blog date sets a base score by age: 85 within 90 days, 80 within 180, 70 within a
-year, 55 within two, 35 within three, 15 within five, 5 beyond that. Social dates use the same
+year, 55 within eighteen months, 35 within three years, 15 within five, 5 beyond that. That
+boundary sat at two years until September 2026, which meant a project whose last blog post was
+in October 2024 still read as Likely Active most of the way through 2026. A date the page
+states about itself uses the same shape capped at 70: under the 85 a commit earns, because a
+content system stamps `dateModified` when a template changes and a hand-written "last updated"
+line goes stale in place, and over the 55 a social post earns, because it is the project
+talking about itself on its own site. Social dates use the same
 brackets capped at 55 and drop to 0 past a year. An archived GitHub repo caps its own
 contribution at 15, since the maintainers said in as many words that they stopped.
 
@@ -69,7 +93,27 @@ the newest dated signal is within a year and 5 when it is older or absent, a dea
 50, and a listing a curator has already pointed at an archive snapshot, whose original URL no
 longer answers, is capped at 10. A homepage that loads is evidence of current work only
 alongside something dated and recent, so on its own it earns the reduced bonus. Reachable social links add 10 in total,
-however many there are. A live site with no dated signal at all gets a floor of 25.
+however many there are.
+
+A live site with no dated signal at all used to get a floor of 25. That floor was never a
+measurement, and 25 sits in the Possibly Inactive band, so a working site with no
+machine-readable timestamp anywhere was published as possibly inactive on no evidence. In
+September 2026 that was 64% of every scored listing. It now reports Unknown instead, and the
+breakdown says nothing dated was found rather than implying the project was measured and found
+wanting.
+
+Three things count as evidence in that otherwise empty case, and each is a floor rather than a
+bonus, so none of them stacks on top of stale evidence to lift an old project into Active:
+
+- A footer copyright naming this year or last floors the score at 45. The site is being kept
+  up even though nothing on it is dated.
+- A listing added to the directory within the last nine months whose "New launch?" field is
+  filled in floors at 60. It does not apply where the site failed to answer or the address is
+  an archive snapshot: being added in March says nothing about a domain that stopped answering
+  in August, and the archive cap exists for that reason and was being undone by the floor.
+- A page that says the thing has closed caps the score at 10 instead, the same as an archive
+  snapshot, and outranks everything above it including a recent launch. Something added in
+  March and closed in July was both.
 
 The issue tracker adjusts the score by 5 either way, and only at the ends of the range: closing
 or merging at least half of the recent traffic adds 5, and closing none of it subtracts 5. A
@@ -95,8 +139,8 @@ enough to lift a listing with no dated signal anywhere to 45 and report it as Li
 
 ## What gets written to Airtable
 
-`Liveliness score`, `Activity status`, `Last activity date`, `Last timeliness check` and
-`Score breakdown`. That is the whole list.
+`Liveliness score`, `Activity status`, `Last activity date`, `Last timeliness check`,
+`Score breakdown`, and `Status` where the reading is unambiguous.
 
 `Score breakdown` is a plain-text account of how the score was reached, written on every run
 and shown to the public on the project's profile page. It names the signal that set the base
@@ -121,9 +165,31 @@ offers, so the figures always add up to the total. The two differ when the 100 c
 cannot go above 100` against its social accounts, and a 35-point listing whose website is down
 loses `-35, because the score cannot go below 0` rather than the full 50.
 
-The `Status` field (Active / Inactive / N/A) stays under human control and is never written by
-the scoring pass. The one exception is that books and documents are marked `N/A` at the start
-of each run, because a book does not have activity to measure.
+The `Status` field (Active / Inactive / N/A) was under human control alone until September
+2026. The scoring pass had always computed a definitive verdict and thrown it away, on purpose,
+until the scoring had been checked against enough edge cases to be trusted with it.
+
+It is written now, but only at the ends of the range: `Active` at 70 and above, `Inactive`
+below 20, and nothing at all in between. A listing reading Likely Active or Possibly Inactive
+keeps whatever a curator gave it. That is what the score is for. Collapsing a middling reading
+into a binary is exactly the judgement this tool should not be making on its own.
+
+`Inactive` carries a further condition, because the word means the thing is dead or
+unreachable rather than old. A great many listings are static resources, a guide or a dataset
+or a reference site, unchanged for years and perfectly usable because they are still up. A low
+score is the right reading of how much is happening there, and `Activity status` keeps
+carrying it, but it is the wrong basis for declaring the thing gone. So `Inactive` is written
+only where the listing cannot be reached, or where its own page says it has finished. A
+project announcing that it has closed is the clearest signal there is and counts on its own,
+however well the site still serves. Where the score is low and neither applies, the breakdown
+says so on the profile rather than leaving an unexplained gap.
+
+The asymmetry is deliberate. Writing `Active` is reversible. Writing `Inactive` is not: a
+record whose Status is `Inactive` is skipped by the scoring queue from then on, so nothing
+re-scores it and a wrong ruling has no later run to correct it.
+
+Books and documents are still marked `N/A` at the start of each run, because a book does not
+have activity to measure.
 
 `Website URL` is read and never written. Replacing it with an archive.org snapshot is the
 graveyard ruling from the dead-link triage codebook, and that ruling is written as one unit:
@@ -154,13 +220,20 @@ and is flagged as a new launch, or if it has been marked exempt by a curator.
 `liveliness-embed-snippet.html` is the meter shown on each project's profile page: a gradient
 strip from grey to green with a marker at the score, the last activity date, the breakdown
 above, and the date of the last check. It is a single self-contained file pasted into a Softr
-custom-code block, and this repo holds the source of truth for it. See the comment at the top
-of the file for what the Softr block has to expose.
+custom-code block or into the page's own header code, and this repo holds the source of truth
+for it. See the comment at the top of the file for what the block has to expose.
 
-Two states it deliberately does not present as an ordinary score. A record with **False
+Pasted into header code the browser leaves the widget at the top of the body, above every
+block, so it moves itself under the first Item details block that appears and waits for one,
+since blocks arrive after the script runs. A widget already sitting inside a block is left
+where it is.
+
+Three states it deliberately does not present as an ordinary score. A record with **False
 inactive** ticked sits at 100 because a curator overruled the algorithm, not because it earned
-it, so the widget says so instead of drawing a full bar. A record with no score at all renders
-nothing rather than an empty meter.
+it, so the widget says so instead of drawing a full bar. A record reporting Unknown shows
+"Not enough to tell" with no number and no marker, and gives the reasons underneath: the
+scorer clears the score on purpose in that case, so a missing score there is a verdict rather
+than a gap. Only a record never checked at all renders nothing.
 
 ## Correcting a wrong verdict
 

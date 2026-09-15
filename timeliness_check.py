@@ -2405,6 +2405,17 @@ def main():
             fields[F_BREAKDOWN]       = result["breakdown"]
             if result["last_activity_date"]:
                 fields[F_LAST_ACTIVITY] = result["last_activity_date"]
+            # Status only where the reading is unambiguous. score_to_status()
+            # returns a value at 70 and above or under 20 and None in between,
+            # so a Likely Active or Possibly Inactive listing keeps whatever a
+            # curator put there. Held back until the scoring had been checked
+            # against edge cases; released 2026-09-15.
+            #
+            # Writing Inactive is one-way: is_excluded() skips a record whose
+            # Status is Inactive, so it leaves the queue and nothing re-scores
+            # it. A wrong one stays wrong with nothing to correct it.
+            if result["status"]:
+                fields[F_STATUS] = result["status"]
         else:
             # Timed out. Last timeliness check still advances so the record
             # cannot block the queue, which leaves the profile page saying it
