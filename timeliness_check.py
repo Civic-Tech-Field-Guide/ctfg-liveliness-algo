@@ -1331,6 +1331,10 @@ COPYRIGHT_FRESH_BONUS     = 10   # footer copyright naming this year or last
 # Below this, a Last-Modified header is the server's clock rather than the age
 # of anything on the page.
 LAST_MODIFIED_MIN_AGE_DAYS = 2
+# Under this many characters of readable text, a page that answered is a
+# JavaScript shell rather than a page. CTFG-curator uses the same threshold in
+# maybeRenderThinPage() before it re-reads the page through a browser.
+MIN_READABLE_PAGE_CHARS = 200
 WEBSITE_ALIVE_BONUS       = 15
 WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
@@ -1845,17 +1849,29 @@ def compute_liveliness(rec):
     # What the project's own page says about itself. The page was already
     # downloaded for the social-link scrape, so this costs no extra request.
     page_copyright_year = None
+    page_unreadable = False
     if website_url and website_alive is True:
         page_html, page_headers = get_page_cached(website_url)
         if page_html:
+            # A site can answer and still say nothing. An app that paints itself
+            # in the browser serves a shell: the questionnaire, the dates, the
+            # notice that it closed months ago all arrive with the JavaScript,
+            # and none of it is in the HTML. Reading no date off a shell is not
+            # the same finding as reading no date off a page, so it is recorded
+            # as its own fact rather than left to look like an absence.
+            readable = readable_page(page_html)["text"]
+            page_unreadable = len(readable) < MIN_READABLE_PAGE_CHARS
             page_signals = page_date_signals(page_html, page_headers, now)
             if page_signals:
                 pdt, plabel = max(page_signals, key=lambda c: c[0])
                 candidates.append((page_recency_score(pdt, now), pdt, plabel))
                 print(f"    page     → {plabel}: {pdt:%Y-%m-%d}")
-            page_copyright_year = footer_copyright_year(page_html)
-            if page_copyright_year:
-                print(f"    page     → footer copyright {page_copyright_year}")
+            if page_unreadable:
+                print(f"    page     → only {len(readable)} chars of text; app shell, not read")
+            else:
+                page_copyright_year = footer_copyright_year(page_html)
+                if page_copyright_year:
+                    print(f"    page     → footer copyright {page_copyright_year}")
 
     best_score = max((c[0] for c in candidates), default=0)
     best_date  = max((c[1] for c in candidates), default=None)
@@ -1938,6 +1954,10 @@ def compute_liveliness(rec):
     # in years — so it is worth a little and never a date. It does count as
     # evidence, though, which is enough to keep the listing out of Unknown: a
     # page that is being rebuilt each year is not a page nothing is known about.
+    if page_unreadable:
+        why.append("The website answers, but its text is built in the browser, so "
+                   "nothing on the page could be read without running it")
+
     fresh_copyright = (page_copyright_year is not None
                        and page_copyright_year >= now.year - 1)
     if fresh_copyright:
