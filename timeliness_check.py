@@ -1841,7 +1841,7 @@ def page_recency_score(dt, now):
     if age_days <= 90:   return 70
     if age_days <= 180:  return 65
     if age_days <= 365:  return 55
-    if age_days <= 730:  return 40
+    if age_days <= STALE_AFTER_DAYS: return 40
     if age_days <= 1095: return 25
     if age_days <= 1825: return 10
     return 3
@@ -1856,6 +1856,13 @@ def website_alive_bonus(best_date, now):
     return WEBSITE_ALIVE_BONUS_STALE
 
 
+# Where "a while ago" stops meaning likely active. At two years, a project
+# silent since its last post still scored into the Likely Active band, so a
+# listing whose last blog post was in 2024 read as likely running well into
+# 2026. Anything past this now has to clear Possibly Inactive on other evidence.
+STALE_AFTER_DAYS = 548   # eighteen months
+
+
 def recency_base_score(dt, now):
     """
     Score 0–85 for GitHub / blog signals based on recency.
@@ -1867,7 +1874,7 @@ def recency_base_score(dt, now):
     if age_days <= 90:   return 85
     if age_days <= 180:  return 80
     if age_days <= 365:  return 70
-    if age_days <= 730:  return 55
+    if age_days <= STALE_AFTER_DAYS: return 55
     if age_days <= 1095: return 35
     if age_days <= 1825: return 15
     return 5
