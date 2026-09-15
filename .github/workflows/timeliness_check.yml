@@ -31,6 +31,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # About one reachable project site in ten paints its text in the browser
+      # and serves a shell to a plain fetch, so those get re-read through
+      # chromium. Measured at roughly 5s a render and ~20 renders a batch, on
+      # top of a download of about half a minute here. The scorer falls back to
+      # recording such a page as unread if this step is removed or the browser
+      # cannot start, so the run does not depend on it.
+      - name: Install chromium for reading script-rendered pages
+        run: python -m playwright install --with-deps chromium
+
       - name: Run timeliness check
         env:
           AIRTABLE_PAT:    ${{ secrets.AIRTABLE_PAT }}
