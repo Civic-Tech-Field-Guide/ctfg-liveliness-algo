@@ -1327,7 +1327,13 @@ RECENT_LAUNCH_SCORE = 60    # lands in the "Likely Active" band
 # reduced bonus: enough to keep the listing off the dead-site penalty, not enough
 # to carry stale work upward. Abre Alcaldias read 100/Active off a 698-day-old
 # blog post plus a live site, because 55 + 15 lands exactly on the Active line.
-COPYRIGHT_FRESH_BONUS     = 10   # footer copyright naming this year or last
+# What a footer copyright naming this year or last is worth. A floor rather than
+# a bonus: added to a score it would stack on top of stale evidence and lift a
+# project whose last real output was years ago into Active, which is the
+# opposite of what the copyright is being read for. As a floor it decides only
+# the case it is evidence about — a site being kept up with nothing dated on it
+# — and never overrules a dated signal that scored higher on its own.
+COPYRIGHT_FRESH_FLOOR     = 45   # the foot of the "Likely Active" band
 # Below this, a Last-Modified header is the server's clock rather than the age
 # of anything on the page.
 LAST_MODIFIED_MIN_AGE_DAYS = 2
@@ -1835,7 +1841,7 @@ def page_recency_score(dt, now):
     if age_days <= 90:   return 70
     if age_days <= 180:  return 65
     if age_days <= 365:  return 55
-    if age_days <= 730:  return 40
+    if age_days <= STALE_AFTER_DAYS: return 40
     if age_days <= 1095: return 25
     if age_days <= 1825: return 10
     return 3
@@ -1850,6 +1856,13 @@ def website_alive_bonus(best_date, now):
     return WEBSITE_ALIVE_BONUS_STALE
 
 
+# Where "a while ago" stops meaning likely active. At two years, a project
+# silent since its last post still scored into the Likely Active band, so a
+# listing whose last blog post was in 2024 read as likely running well into
+# 2026. Anything past this now has to clear Possibly Inactive on other evidence.
+STALE_AFTER_DAYS = 548   # eighteen months
+
+
 def recency_base_score(dt, now):
     """
     Score 0–85 for GitHub / blog signals based on recency.
@@ -1861,7 +1874,7 @@ def recency_base_score(dt, now):
     if age_days <= 90:   return 85
     if age_days <= 180:  return 80
     if age_days <= 365:  return 70
-    if age_days <= 730:  return 55
+    if age_days <= STALE_AFTER_DAYS: return 55
     if age_days <= 1095: return 35
     if age_days <= 1825: return 15
     return 5
@@ -2174,14 +2187,30 @@ def compute_liveliness(rec):
                        and page_copyright_year >= now.year - 1)
     if fresh_copyright:
         before = score
-        score  = min(score + COPYRIGHT_FRESH_BONUS, 100)
-        why.append(_adjustment("Footer copyright reads %d" % page_copyright_year,
-                               COPYRIGHT_FRESH_BONUS, score - before))
+        score  = max(score, COPYRIGHT_FRESH_FLOOR)
+        if score > before:
+            why.append(_adjustment(
+                "The site's footer copyright reads %d, so it is being kept up even "
+                "though nothing on it is dated" % page_copyright_year,
+                COPYRIGHT_FRESH_FLOOR - before, score - before))
+        else:
+            why.append("The site's footer copyright reads %d, which the signals above "
+                       "already account for" % page_copyright_year)
 
     # A recent launch is evidence in its own right, and the only positive
     # evidence available for a listing with nothing dated anywhere. Applied as a
     # floor so a measured score above it is left alone.
     recent_launch = recently_launched(rec, now)
+    # A launch flag cannot outvote the site being gone. Added to the directory in
+    # March says nothing about a domain that stopped answering in August, and an
+    # address that now resolves to an archive snapshot has already been capped
+    # for exactly that reason — the floor would undo the cap.
+    if recent_launch and (website_alive is False or is_archived):
+        why.append("Added to the directory in the last nine months and marked as a "
+                   "launch, but %s, which is the better evidence"
+                   % ("its address is an archive snapshot" if is_archived
+                      else "its website no longer answers"))
+        recent_launch = False
     if recent_launch:
         before = score
         score  = max(score, RECENT_LAUNCH_SCORE)
