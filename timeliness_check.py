@@ -1341,6 +1341,9 @@ LAST_MODIFIED_MIN_AGE_DAYS = 2
 # JavaScript shell rather than a page. CTFG-curator uses the same threshold in
 # maybeRenderThinPage() before it re-reads the page through a browser.
 MIN_READABLE_PAGE_CHARS = 200
+# How long to wait before re-checking a site that failed, when the failure is
+# about to be written as a permanent verdict.
+RECHECK_PAUSE_S = 5
 # What a listing scores once its own page says it has finished. Matches the cap
 # an archive snapshot gets: both are the page telling us the thing is over.
 CLOSED_CAP = 10
@@ -2277,6 +2280,24 @@ def compute_liveliness(rec):
     if status == "Inactive":
         says_finished = page_closed
         unreachable   = (website_alive is False) or is_archived or no_signals
+
+        # A single failed fetch is not proof a site has gone. _try_fetch()
+        # already retries a connection error once, and a blip lasting seconds
+        # survives that: a federal ministry's site was recorded as not
+        # responding on one run and answered normally minutes later. Since this
+        # verdict removes the record from the queue for good, an unreachable
+        # site is checked once more before it counts, far enough after the first
+        # attempt to outlast a blip. Only the handful of records heading for
+        # Inactive pay for it.
+        if unreachable and website_alive is False and website_url:
+            time.sleep(RECHECK_PAUSE_S)
+            again, _ = check_website(website_url)
+            if again is not False:
+                why.append("The website did not answer when it was first checked but "
+                           "answered when it was tried again, so this is not recorded "
+                           "as inactive")
+                unreachable = False
+
         if not (says_finished or unreachable):
             why.append("The score is low, but the site still answers and nothing on it "
                        "says the project has finished, so it is not recorded as "
