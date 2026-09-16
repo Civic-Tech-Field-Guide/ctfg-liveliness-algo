@@ -45,9 +45,18 @@ jobs:
           AIRTABLE_PAT:    ${{ secrets.AIRTABLE_PAT }}
           GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}  # built-in ephemeral token; read-only per permissions block
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          # Only the handful of listings the rules cannot settle reach the model,
-          # capped per run by ADJUDICATE_MAX_RUN. Unset the secret, or set
-          # ADJUDICATE=0, and those listings fall back to the deterministic
-          # reading exactly as before.
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python timeliness_check.py
+
+      # The handful of pages the rules cannot settle are written to a queue file
+      # rather than read during the run. Nothing here reads them: that pass runs
+      # on Matt's own hardware, so the queue has to leave the runner or it dies
+      # with it. Uploaded even when the run fails, because a run that stopped
+      # halfway still queued the records it got through.
+      - name: Upload the pages awaiting a reading
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: adjudication-queue-${{ github.run_id }}
+          path: adjudication/queue.jsonl
+          if-no-files-found: ignore
+          retention-days: 30

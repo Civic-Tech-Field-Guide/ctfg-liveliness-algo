@@ -1424,6 +1424,22 @@ RECHECK_PAUSE_S = 5
 # What a listing scores once its own page says it has finished. Matches the cap
 # an archive snapshot gets: both are the page telling us the thing is over.
 CLOSED_CAP = 10
+
+# Where the finding came from is part of the finding. A wording match is a rule
+# anyone can check; a reading is a judgement, and the breakdown says which one
+# this was so a project disputing it knows what to argue with. Written here as
+# one sentence with two openings because apply_adjudications.py rebuilds the
+# same breakdown line hours later, and two copies of this wording would drift.
+CLOSURE_SOURCE_WORDING = "The project's own page says"
+CLOSURE_SOURCE_READING = "A reading of the project's own page finds"
+
+
+def closure_sentence(source, phrase, capped=""):
+    """The breakdown line for a page that says the thing it describes is over."""
+    return ('%s it has finished ("%s"), so it is not scored on how recently '
+            'that page changed%s' % (source, phrase, capped))
+
+
 WEBSITE_ALIVE_BONUS       = 15
 WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
@@ -1838,7 +1854,7 @@ def render_page_text(url):
                 pass
 
 
-# ── Reading a page the rules cannot settle ────────────────────────────────────
+# ── Pages the rules cannot settle ─────────────────────────────────────────────
 #
 # Some questions do not reduce to a keyword. A conference closes registration
 # because it is about to happen; a consultation closes because it is over. Both
@@ -1847,99 +1863,67 @@ def render_page_text(url):
 # conference, and removing it lost a genuinely finished initiative whose page
 # said "Public voting closed on December 31, 2021".
 #
-# So the narrow cases go to a model, and only those. It is asked one question
-# about one page, its answer is quoted into the public breakdown next to
-# everything else, and it can decline. Fewer than one listing in twenty reaches
-# it. Everything the deterministic checks can settle is settled without it,
-# because a score a project can contest has to rest on something a project can
-# inspect.
+# Those pages need reading, and reading is a model's job. It does not have to
+# happen while the sweep is running, though, and there are good reasons for it
+# not to. A call in the middle of scoring puts a paid API on the critical path
+# of a 200-record run, makes the run's cost a function of how many odd pages it
+# happened to meet, and gives the model's answer the same authority as a
+# regexp, written to Airtable in the same second with nothing between it and a
+# listing being retired.
+#
+# So the sweep queues instead. A page the rules cannot settle is written to
+# adjudication/queue.jsonl with its text and with what the run made of it
+# without any reading, and the run carries on. The reading is a separate pass
+# over that file, on hardware already paid for (adjudicate.mjs), and a verdict
+# that would retire a project is held for review rather than written.
+#
+# The record's own score is unaffected by the queueing: it is scored exactly as
+# it would have been had no model existed, which is also what it keeps if the
+# pass is never run. Nothing in the public breakdown mentions a pending
+# reading, deliberately: a line saying a verdict is coming would sit on the
+# profile page forever if the pass never came.
 
 ADJUDICATE          = os.environ.get("ADJUDICATE", "1") != "0"
-ADJUDICATE_MODEL    = "claude-opus-5"
-ADJUDICATE_MAX_RUN  = int(os.environ.get("ADJUDICATE_MAX_RUN", "60"))
+ADJUDICATION_DIR    = os.environ.get("ADJUDICATION_DIR", "adjudication")
+ADJUDICATION_QUEUE  = os.path.join(ADJUDICATION_DIR, "queue.jsonl")
 ADJUDICATE_PAGE_CAP = 6000
 
-_adjudications = 0
 
-_ADJUDICATE_SYSTEM = """You read the homepage of a civic technology project and answer one \
-question: has the project itself finished?
-
-Finished means the thing the listing is about has ended and will not resume. A page saying \
-an organisation has wound down, a consultation has closed, a programme has run its course or \
-a service has been retired is finished.
-
-It is NOT finished when only an intake window has closed. Registration closing, applications \
-closing, a submission deadline passing, nominations closing or voting for one round ending \
-are all routine events on a project that is running, and a recurring event closes \
-registration precisely because it is about to take place.
-
-Say "unclear" whenever the page does not settle it. Unclear is the right answer for most \
-pages and carries no penalty: something else decides those. Only answer "finished" on \
-wording that states it, and quote that wording exactly as it appears."""
-
-
-def adjudicate_finished(name, url, text):
+def adjudication_candidate(name, url, text):
     """
-    Ask whether a page says the project itself has finished.
+    The page as a queue row, or None when there is nothing worth asking about.
 
-    Returns (verdict, evidence, reason) with verdict one of "finished",
-    "running" or "unclear", or (None, None, None) when no call was made.
-    Every failure returns the None form: no key, no package, a refusal, a
-    malformed answer or the per-run cap. A listing then falls back to whatever
-    the deterministic checks made of it, which is what happened before this
-    existed.
+    Only the page and its address: what the run made of the record is added at
+    the end of compute_liveliness(), where the arithmetic is still in scope.
     """
-    global _adjudications
     if not (ADJUDICATE and text and text.strip()):
-        return None, None, None
-    if _adjudications >= ADJUDICATE_MAX_RUN:
-        return None, None, None
-    try:
-        import anthropic
-    except ImportError:
-        return None, None, None
+        return None
+    return {"name": name, "url": url, "text": text[:ADJUDICATE_PAGE_CAP]}
 
+
+def queue_adjudication(record_id, entry):
+    """
+    Append one page to the queue the local pass reads.
+
+    Appending, never rewriting: a run that is killed halfway keeps the rows it
+    had already written, and two runs can queue into the same file. Duplicate
+    record ids are expected, because the same listing comes round again on the
+    next sweep, and adjudicate.mjs rules the newest row for an id and drops the
+    rest: the older row's page text is months stale.
+
+    A queue that cannot be written is not a reason to fail a scoring run: the
+    scores are already correct without it.
+    """
     try:
-        client = anthropic.Anthropic()
-        _adjudications += 1
-        response = client.messages.create(
-            model=ADJUDICATE_MODEL,
-            max_tokens=1000,
-            system=_ADJUDICATE_SYSTEM,
-            output_config={
-                "effort": "low",          # one narrow question about one page
-                "format": {
-                    "type": "json_schema",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "verdict":  {"type": "string",
-                                         "enum": ["finished", "running", "unclear"]},
-                            "evidence": {"type": "string"},
-                            "reason":   {"type": "string"},
-                        },
-                        "required": ["verdict", "evidence", "reason"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            messages=[{"role": "user", "content":
-                       "Project: %s\nAddress: %s\n\nPage text:\n%s"
-                       % (name, url, text[:ADJUDICATE_PAGE_CAP])}],
-        )
-        if response.stop_reason == "refusal":
-            return None, None, None
-        raw = next((b.text for b in response.content if b.type == "text"), None)
-        if not raw:
-            return None, None, None
-        data = json.loads(raw)
-        verdict = data.get("verdict")
-        if verdict not in ("finished", "running", "unclear"):
-            return None, None, None
-        return verdict, (data.get("evidence") or "")[:160], (data.get("reason") or "")[:200]
-    except Exception as e:
-        print(f"    adjudicate → unavailable ({type(e).__name__})")
-        return None, None, None
+        os.makedirs(ADJUDICATION_DIR, exist_ok=True)
+        row = dict(entry, id=record_id,
+                   queued=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        with open(ADJUDICATION_QUEUE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return True
+    except OSError as e:
+        print(f"    queue    → could not write {ADJUDICATION_QUEUE} ({e.strerror})")
+        return False
 
 
 # ── Pages that say the thing is over ──────────────────────────────────────────
@@ -2251,7 +2235,7 @@ def compute_liveliness(rec):
     page_copyright_year = None
     page_unreadable = False
     page_closed, page_closed_phrase = False, None
-    adjudicated = False
+    pending_adjudication = None
     if website_url and website_alive is True:
         page_html, page_headers = get_page_cached(website_url)
         if page_html:
@@ -2286,15 +2270,12 @@ def compute_liveliness(rec):
             elif not page_unreadable and not page_signals:
                 # The wording check found nothing and neither did any date. This
                 # is the narrow band the rules cannot settle, so it is the only
-                # band worth asking about.
+                # band worth queueing for a reading. The run does not wait for
+                # one: it scores this record as though no reading existed.
                 words = rendered if rendered is not None else readable
-                verdict, evidence, reason = adjudicate_finished(name, website_url, words)
-                if verdict:
-                    print(f"    adjudicate → {verdict}: {evidence!r}")
-                if verdict == "finished":
-                    page_closed = True
-                    page_closed_phrase = evidence or reason
-                    adjudicated = True
+                pending_adjudication = adjudication_candidate(name, website_url, words)
+                if pending_adjudication:
+                    print(f"    page     → nothing the rules can settle; queued for reading")
             if page_unreadable:
                 print(f"    page     → still unread after rendering")
             else:
@@ -2448,15 +2429,8 @@ def compute_liveliness(rec):
     if page_closed:
         before = score
         score  = min(score, CLOSED_CAP)
-        # Where the finding came from is part of the finding. A wording match is
-        # a rule anyone can check; a reading is a judgement, and the breakdown
-        # says which one this was so a project disputing it knows what to argue
-        # with.
-        source = ("A reading of the project's own page finds" if adjudicated
-                  else "The project's own page says")
         capped = "" if score == before else " (capped at %g)" % CLOSED_CAP
-        why.append('%s it has finished ("%s"), so it is not scored on how recently '
-                   'that page changed%s' % (source, page_closed_phrase, capped))
+        why.append(closure_sentence(CLOSURE_SOURCE_WORDING, page_closed_phrase, capped))
 
     # Fully unknown: nothing could be checked at all
     no_signals = (best_date is None and website_alive is None and accessible_count == 0)
@@ -2520,6 +2494,39 @@ def compute_liveliness(rec):
                        "says the project has finished, so it is not recorded as "
                        "inactive: a resource that is still up is still usable")
             status = None
+    # What a "finished" verdict would make of this record, worked out here where
+    # the rest of the arithmetic is still in scope. The reading happens hours
+    # later against nothing but the queue file, so the alternative has to travel
+    # with the row: a score alone cannot be turned back into one, because a
+    # closure does not only cap the number. It also settles the question Unknown
+    # was reported for, so a record with nothing dated stops being Unknown and
+    # becomes a measurement. Only a listing with nothing checkable at all stays
+    # Unknown, and that is what no_signals already means.
+    if pending_adjudication is not None:
+        closed_score = round(min(score, CLOSED_CAP), 1)
+        pending_adjudication.update({
+            "score":                  None if unknown else score,
+            # The number before Unknown could clear it and before any cap, which
+            # is what tells the applier whether the closure cap actually moved
+            # anything or the score was already under it.
+            "raw_score":              score,
+            "activity_status":        activity_status,
+            "status":                 status,
+            # The reasons as they stand here, which is deliberately before the
+            # closing lines: the "nothing dated was found" paragraph and the
+            # Total are both answers to questions a closure re-opens, and a
+            # rebuilt breakdown wants them written fresh rather than stripped.
+            "reasons":                list(why),
+            "closed_score":           None if no_signals else closed_score,
+            "closed_activity_status": "Unknown" if no_signals
+                                      else score_to_activity_status(closed_score),
+            # A page that says it has finished is the evidence the Inactive
+            # guard above asks for, so score_to_status() is not second-guessed
+            # here the way it is for a low score with no such statement.
+            "closed_status":          None if no_signals
+                                      else score_to_status(closed_score),
+        })
+
     if unknown:
         score = None            # clears the field rather than publishing a number
 
@@ -2551,6 +2558,7 @@ def compute_liveliness(rec):
         "status":             status,
         "breakdown":          breakdown,
         "discovered_url":     discovered_url,
+        "adjudication":       pending_adjudication,
     }
 
 
@@ -2592,10 +2600,19 @@ def main():
     parser = argparse.ArgumentParser(description="CTFG timeliness checker")
     parser.add_argument("--records", nargs="+", metavar="recXXX",
                         help="Specific record IDs to check (skips normal batch queue)")
+    # Scores everything and writes nothing. The queue file is still written,
+    # which is the point: it is how a batch of real pages is collected for the
+    # eval set without a run of the scorer landing on 200 live listings.
+    parser.add_argument("--no-write", action="store_true",
+                        help="Score and queue as normal, but send nothing to Airtable")
     args = parser.parse_args()
 
+    if args.no_write:
+        print("--no-write: nothing will be sent to Airtable. "
+              "Pages the rules cannot settle are still queued.\n")
+
     # Restore records a curator flagged as wrongly scored, before anything else
-    restored = restore_scored_wrong()
+    restored = [] if args.no_write else restore_scored_wrong()
     if restored:
         print(f"Restoring {len(restored)} wrongly scored record(s)...")
         for name, value, stale_score in restored:
@@ -2605,7 +2622,7 @@ def main():
         print()
 
     # Mark books/document listings as N/A before the normal timeliness check
-    na_records = fetch_na_candidates()
+    na_records = [] if args.no_write else fetch_na_candidates()
     if na_records:
         print(f"Marking {len(na_records)} books/document record(s) as N/A...")
         na_updates = [{"id": r["id"], "fields": {F_STATUS: "N/A"}} for r in na_records]
@@ -2637,6 +2654,7 @@ def main():
     print(f"Got {len(records)} records.\n")
     today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     updates      = []
+    queued       = 0
     rate_limited = False
 
     signal.signal(signal.SIGALRM, _record_timeout_handler)
@@ -2690,7 +2708,15 @@ def main():
         # Write each record as soon as it's done: a stalled or killed run keeps
         # its progress, and Last timeliness check always advances the queue
         # past a record that hangs.
-        at_patch(LISTINGS_TABLE, [{"id": rec["id"], "fields": fields}])
+        if not args.no_write:
+            at_patch(LISTINGS_TABLE, [{"id": rec["id"], "fields": fields}])
+
+        # Queued after the write, not before it: the row describes a record
+        # whose score is already in Airtable, so a run that dies between the
+        # two leaves a scored record and no queue row rather than the reverse.
+        if (result or {}).get("adjudication"):
+            if queue_adjudication(rec["id"], result["adjudication"]):
+                queued += 1
 
         update = {"id": rec["id"], "fields": fields}
         update["_discovered_url"] = (result or {}).get("discovered_url")  # stored locally, not sent to Airtable
@@ -2700,8 +2726,15 @@ def main():
     if rate_limited:
         print(f"\n✗ Stopped early — {len(updates)} record(s) written before the "
               f"GitHub rate limit was hit.\n")
+    elif args.no_write:
+        print(f"\n✓ Done — {len(updates)} record(s) scored, none written.\n")
     else:
         print(f"\n✓ Done — {len(updates)} record(s) written.\n")
+
+    if queued:
+        print(f"{queued} page(s) the rules could not settle were queued to "
+              f"{ADJUDICATION_QUEUE}. They are scored as though no reading existed; "
+              f"run adjudicate.mjs to read them.\n")
     print(f"{'Record ID':<20} {'Score':>7}  {'Activity status':<20}  {'Status':<10}  Last activity")
     print("-" * 80)
     for u in updates:

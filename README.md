@@ -201,6 +201,60 @@ just the URL leaves a record with an archive link, no Graveyard tag and `Status:
 is a state the codebook has no name for. This tool wrote that state until 2026-09-08; it no
 longer does.
 
+## Pages the rules cannot settle
+
+Some questions do not reduce to a keyword. A conference closes registration because it is about to happen; a consultation closes because it is over. Both write "closed" on the page, and a subject list that tells them apart for one gets the other wrong: a list containing "registration" retired a live conference, and removing it lost a genuinely finished initiative whose page said "Public voting closed on December 31, 2021".
+
+Those pages need reading, and reading is a model's job. The sweep does not do it. When its wording checks find nothing and no date can be read off the page either, it writes the page to `adjudication/queue.jsonl` and carries on. That is fewer than one listing in twenty, and it is the only band where a reading changes anything, because everywhere else something deterministic has already decided.
+
+The record is scored exactly as it would have been had no model existed, which is also what it keeps if nobody ever runs the reading pass. Nothing in the public breakdown mentions that a reading is pending: a line saying a verdict is coming would sit on the profile page forever if the pass never came.
+
+The scheduled run uploads the queue as a workflow artifact, since the pass runs elsewhere.
+
+### Reading the queue
+
+`adjudicate.mjs` reads the queued pages through LM Studio on the Mac Studio over Tailscale, using CTFG-curator's `lib/local-llm.mjs` unchanged: it confirms the model is already resident with a window big enough for the prompt plus the reply, spreads calls across however many instances are loaded, and never loads or unloads anything, because the host is shared.
+
+```sh
+node adjudicate.mjs status                  # what is queued, ruled and measured
+node adjudicate.mjs rule                    # → adjudication/verdicts.jsonl
+node adjudicate.mjs rule --dry              # print the rulings, write nothing
+```
+
+One page per request, never batched. The page text is the whole prompt and the queue is in the hundreds, so a batch that came back covering three of four pages would cost more to detect than the requests it saved. A page too long for the loaded window is left in the queue rather than truncated, and a reply that will not parse leaves its page unruled, which is the same outcome as never having asked.
+
+Set `CTFG_LOCAL_LLM` if the CTFG-curator checkout is not a sibling directory.
+
+### The eval comes first
+
+`rule` refuses to run until an eval exists for the model it is about to use, covering at least 25 labelled pages. A verdict nobody has measured reads the same as a measured one once it is in the ledger, which is the reason for the order.
+
+```sh
+python timeliness_check.py --no-write       # score and queue, send nothing to Airtable
+node adjudicate.mjs sample --n 35           # → eval/adjudication-set.jsonl, unlabelled
+# label each row: finished, running or unclear
+node adjudicate.mjs eval                    # → eval/adjudication-eval.json
+```
+
+The sample is a blind draw from what the sweep actually queued, not a hand-picked set: picking the interesting pages measures the interesting pages. Label each row from the page text stored in it rather than by opening the site, because that text is what the model is given.
+
+The eval reports agreement overall, and separately the number that decides whether any of this is usable: how often the model said "finished" about a project that had not finished. The costs are not symmetrical. An "unclear" that should have been "finished" leaves a listing scored exactly as it is scored today. A "finished" on a live project is a proposal to retire it.
+
+The eval set and its results are committed, along with `eval/README.md`, which records how each page was labelled and what the measurement does and does not cover. The queue and the ledgers are not committed: the queue is a copy of other people's web pages and the ledgers are a record of one machine's runs.
+
+As measured on 2026-09-16, `openai/gpt-oss-120b` agreed with the label on 27 of 35 pages and said "finished" zero times, so it raised no false alarms. It also caught nothing, because not one page in that draw had finished. Recall is unmeasured and `eval/README.md` says what it would take to measure it.
+
+### What a ruling changes
+
+```sh
+python apply_adjudications.py               # triage, writes no record
+python apply_adjudications.py --commit      # write the accepted readings
+```
+
+A "running" or "unclear" ruling changes nothing and is resolved without a request. The sweep already scored that record as though no reading existed, and the reading agrees there is nothing to add.
+
+A "finished" ruling caps the score at `CLOSED_CAP`, which puts `Status` at Inactive, and an Inactive record is skipped by every later run. Nothing comes back to re-score it, so a wrong one stays wrong with nothing to correct it. Those rulings go to `adjudication/review.jsonl` with `decision: null` for a person to set to `accept` or `reject`, and `--commit` writes only the accepted ones. The breakdown it writes says the finding came from a reading rather than from a wording match, so a project disputing it knows what to argue with.
+
 ## Dead links are not triaged here
 
 A dead link is four situations in the codebook and each gets a different ruling: skip a mirror
@@ -282,9 +336,10 @@ export YOUTUBE_API_KEY=...     # optional, enables YouTube post dates
 
 python timeliness_check.py                       # next batch of 200
 python timeliness_check.py --records recABC123   # named records only
+python timeliness_check.py --no-write            # score and queue, write nothing
 ```
 
-Both write to Airtable. `check_record.py` is the diagnostic counterpart: it prints every
+The first two write to Airtable; `--no-write` is how a batch of real pages is collected for the eval set without a run landing on 200 live listings. `check_record.py` is the diagnostic counterpart: it prints every
 signal found for one listing and writes nothing, so it is the one to reach for when a score
 looks wrong. It takes no arguments, so set `RECORD_ID` and the URLs in the block near the
 bottom of the file before running it.
