@@ -209,11 +209,11 @@ Those pages need reading, and reading is a model's job. The sweep does not do it
 
 The record is scored exactly as it would have been had no model existed, which is also what it keeps if nobody ever runs the reading pass. Nothing in the public breakdown mentions that a reading is pending: a line saying a verdict is coming would sit on the profile page forever if the pass never came.
 
-The scheduled run uploads the queue as a workflow artifact, since the pass runs elsewhere.
+The scheduled run uploads the queue as a workflow artifact, since the reading pass runs elsewhere.
 
 ### Reading the queue
 
-`adjudicate.mjs` reads the queued pages through LM Studio on the Mac Studio over Tailscale, using CTFG-curator's `lib/local-llm.mjs` unchanged: it confirms the model is already resident with a window big enough for the prompt plus the reply, spreads calls across however many instances are loaded, and never loads or unloads anything, because the host is shared.
+`adjudicate.mjs` reads the queued pages with a local model, using CTFG-curator's `lib/local-llm.mjs` unchanged: it confirms the model is already resident with a window big enough for the prompt plus the reply, spreads calls across however many instances are loaded, and never loads or unloads anything, because the host is shared. `CTFG_LLM_BASE_URL` and `CTFG_LLM_MODEL` say which host and which model.
 
 ```sh
 node adjudicate.mjs status                  # what is queued, ruled and measured

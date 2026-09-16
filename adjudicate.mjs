@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Reading the pages the scoring rules cannot settle, on the Mac Studio.
+// Reading the pages the scoring rules cannot settle, with a local model.
 //
 //   node adjudicate.mjs <sample|eval|rule|status> [flags]
 //
@@ -26,6 +26,9 @@
 // checks the model is resident with a window big enough for the prompt plus
 // the reply, dealer() spreads calls over however many instances are loaded,
 // and nothing here loads or unloads anything. The host is shared.
+//
+// Set CTFG_LLM_BASE_URL and CTFG_LLM_MODEL to point it at a different host or
+// model; both are read by local-llm.mjs.
 
 import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -33,10 +36,9 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// CTFG-curator is a sibling checkout on Matt's machine, and this pass only
-// runs there anyway: it needs Tailscale to the Mac Studio. Copying local-llm.mjs
-// in here would give two copies to keep in step, and the lessons in its header
-// were expensive enough the first time.
+// CTFG-curator is a sibling checkout, and it owns the client for the local
+// model host. Copying that file in here would give two copies to keep in step,
+// and the lessons in its header were expensive enough the first time.
 const LOCAL_LLM = process.env.CTFG_LOCAL_LLM
   ?? join(__dirname, "..", "CTFG-curator", "lib", "local-llm.mjs");
 
@@ -94,11 +96,11 @@ if (!COMMANDS.includes(CMD)) {
           eval/adjudication-eval.json. Prints the confusion matrix and, on its
           own line, the number that decides whether this is usable: how often
           the model said "finished" about a project that had not finished.
-          --model <id>       an LM Studio model id (default ${DEFAULT_MODEL})
+          --model <id>       a model id on the local host (default ${DEFAULT_MODEL})
           --concurrency N    requests in flight (default: 2 per instance)
 
   rule    Read every queued page not already ruled → adjudication/verdicts.jsonl
-          --model <id>       an LM Studio model id (default ${DEFAULT_MODEL})
+          --model <id>       a model id on the local host (default ${DEFAULT_MODEL})
           --limit N          stop after N pages
           --concurrency N    requests in flight (default: 2 per instance)
           --ids <a,b,c>      rule exactly these record ids
