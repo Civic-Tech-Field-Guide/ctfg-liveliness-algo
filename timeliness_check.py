@@ -1436,6 +1436,13 @@ CLOSURE_SOURCE_READING = "A reading of the project's own page finds"
 
 def closure_sentence(source, phrase, capped=""):
     """The breakdown line for a page that says the thing it describes is over."""
+    # The sentence supplies the quotation marks, so a phrase that arrives
+    # already quoted must not bring its own. A reading often quotes the page
+    # itself, and nesting the two produced a breakdown that opened on a double
+    # quote mark and read as a typo to anyone looking at the profile page.
+    phrase = re.sub(r'^[\s"\u201c\u201d\u00ab\u00bb\u2018\u2019]+|'
+                    r'[\s"\u201c\u201d\u00ab\u00bb\u2018\u2019]+$', "", str(phrase or ""))
+    phrase = phrase.replace('"', "\u201d")
     return ('%s it has finished ("%s"), so it is not scored on how recently '
             'that page changed%s' % (source, phrase, capped))
 
@@ -1605,11 +1612,82 @@ def readable_page(html, text_cap=12000, footer_cap=800):
     return {"footer": footer or None, "text": _clean(stripped)[:text_cap]}
 
 
-_MONTHS = {m.lower(): i for i, m in enumerate(
-    ["January", "February", "March", "April", "May", "June", "July",
-     "August", "September", "October", "November", "December"], 1)}
-for _full, _i in list(_MONTHS.items()):
-    _MONTHS[_full[:3]] = _i
+# Month names in the languages this directory actually meets. A date is a
+# recency signal whatever language the page is written in, and reading only
+# English ones meant a federal ministry publishing several times a week and a
+# département running a 2026 budget consultation were both recorded as pages
+# with no date on them at all.
+#
+# West and South Slavic month names are deliberately absent. They collide
+# across languages in the one way that matters: "listopad" is November in
+# Polish and October in Croatian, "srpanj" is July in Croatian while Czech
+# "srpen" is August, and nothing on the page says which language it is. Finding
+# no date is a safe answer and is already handled everywhere downstream. A date
+# eleven months out is not, because it is indistinguishable from a real one.
+_MONTH_NAMES = {
+    1:  "January enero janeiro janvier Januar Jänner gennaio januari januar "
+        "tammikuu Ocak ianuarie gener",
+    2:  "February febrero fevereiro février Februar febbraio februari februar "
+        "helmikuu Şubat februarie febrer",
+    3:  "March marzo março mars März marzo maart mars marts maaliskuu Mart "
+        "martie març",
+    4:  "April abril avril aprile april huhtikuu Nisan aprilie",
+    5:  "May mayo maio mai Mai maggio mei maj toukokuu Mayıs mayis maig",
+    6:  "June junio junho juin Juni giugno juni kesäkuu Haziran iunie juny",
+    7:  "July julio julho juillet Juli luglio juli heinäkuu Temmuz iulie juliol",
+    8:  "August agosto agosto août August agosto augustus augusti elokuu "
+        "Ağustos august agost",
+    9:  "September septiembre setiembre setembro septembre September settembre "
+        "syyskuu Eylül septembrie setembre",
+    10: "October octubre outubro octobre Oktober ottobre oktober lokakuu Ekim "
+        "octombrie octubre",
+    11: "November noviembre novembro novembre November novembre marraskuu "
+        "Kasım kasim noiembrie novembre",
+    12: "December diciembre dezembro décembre Dezember dicembre december "
+        "desember joulukuu Aralık aralik decembrie desembre",
+}
+
+_MONTHS = {}
+for _i, _names in _MONTH_NAMES.items():
+    for _n in _names.split():
+        _MONTHS[_n.lower()] = _i
+
+# Three-letter forms, generated rather than listed, then any that two different
+# months both claim is dropped. French "juin" and "juillet" both shorten to
+# "jui", and Finnish "marraskuu" collides with every language's March; keeping
+# either would turn a date the page states plainly into a wrong one.
+_prefixes = {}
+for _n, _i in _MONTHS.items():
+    if len(_n) > 3:
+        _prefixes.setdefault(_n[:3], set()).add(_i)
+for _p, _months in _prefixes.items():
+    if len(_months) == 1 and _p not in _MONTHS:
+        _MONTHS[_p] = next(iter(_months))
+
+# English abbreviations put back by hand, because the rule above drops "mar" to
+# protect against Finnish "marraskuu" and "Mar" is the single most common
+# abbreviation on the web. No Finnish page writes November as "mar"; Finnish
+# abbreviates its months as numbers.
+for _abbr, _i in {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                  "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10,
+                  "nov": 11, "dec": 12}.items():
+    _MONTHS[_abbr] = _i
+
+# A wrong month is worse than no month, so the table is checked at import rather
+# than trusted. Anything that would resolve two ways is a bug in the lists above.
+assert len(_MONTHS) == len(set(_MONTHS)), "duplicate month key"
+
+# Any Unicode letter, so "février", "März" and "Ağustos" are month names rather
+# than gibberish. [A-Za-z] silently truncated every accented name to the run of
+# plain letters inside it.
+_L = r"[^\W\d_]"
+
+# The day, with whatever a language puts after it: a dot in German and Finnish,
+# an ordinal suffix in English, "er" in French, a masculine ordinal in Iberian
+# and Italian writing.
+_DAY = r"(\d{1,2})(?:\.|st|nd|rd|th|er|º|°|ª)?"
+# "16 de septiembre de 2026", "16 di settembre", "16th of March".
+_OF = r"(?:\s+(?:de|di|of|d'))?"
 
 
 def _parse_date_loose(raw, now):
@@ -1622,20 +1700,24 @@ def _parse_date_loose(raw, now):
     s = _clean(raw)[:60]
     if not s:
         return None
-    dt = None
+
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)                       # ISO
     if m:
         y, mo, d = (int(g) for g in m.groups())
     else:
-        m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})", s)  # 20 March 2026
+        # 20 March 2026 / 16. September 2026 / 16 de septiembre de 2026
+        m = re.search(r"%s%s\s+(%s{3,12})\.?%s\s+(\d{4})" % (_DAY, _OF, _L, _OF), s, re.U)
         if m and m.group(2).lower() in _MONTHS:
             d, mo, y = int(m.group(1)), _MONTHS[m.group(2).lower()], int(m.group(3))
         else:
-            m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", s)  # March 20, 2026
+            m = re.search(r"(%s{3,12})\.?\s+(\d{1,2}),?\s+(\d{4})" % _L, s, re.U)  # March 20, 2026
             if m and m.group(1).lower() in _MONTHS:
                 mo, d, y = _MONTHS[m.group(1).lower()], int(m.group(2)), int(m.group(3))
             else:
-                return None
+                parsed = _parse_numeric_date(s)
+                if not parsed:
+                    return None
+                y, mo, d = parsed
     try:
         dt = datetime(y, mo, d, tzinfo=timezone.utc)
     except ValueError:
@@ -1645,18 +1727,72 @@ def _parse_date_loose(raw, now):
     return dt
 
 
+def _parse_numeric_date(s):
+    """
+    (y, m, d) from an all-digits date, or None when the order cannot be known.
+
+    16.09.2026 is read as day first. The dot form is European convention and is
+    not written the American way round, so it is safe to read on sight.
+
+    16/09/2026 is not. The slash form is day-first across most of the world and
+    month-first in the United States, and 05/06/2026 is a real date in both
+    readings, eleven months of error apart. So it is read only when one of the
+    first two numbers is over 12 and can therefore only be a day. An ambiguous
+    one returns None, which leaves the listing exactly where it would have been
+    before any of this existed.
+    """
+    m = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", s)
+    if m:
+        d, mo, y = (int(g) for g in m.groups())
+        return (y, mo, d) if 1 <= mo <= 12 else None
+
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", s)
+    if m:
+        a, b, y = (int(g) for g in m.groups())
+        if a > 12 and 1 <= b <= 12:
+            return (y, b, a)          # first number cannot be a month
+        if b > 12 and 1 <= a <= 12:
+            return (y, a, b)          # second cannot be, so the first is
+        return None                   # both under 13: unknowable, so not read
+    return None
+
+
 # Where a page states its own date, best evidence first.
 _META_DATE_PROPS = ["article:modified_time", "og:updated_time", "article:published_time",
                     "dateModified", "datePublished", "last-modified", "DC.date", "date"]
 
-# The capture is a lookahead so the match itself ends at the keyword. A page
-# that prints "Published: 6 January 2026 Last updated: 20 March 2026" as two
-# stacked lines collapses to one line of text once the tags are stripped, and a
-# consuming capture swallowed the second label with the first date — reporting
+# The words a page puts in front of its own date, in the languages above. The
+# capture is a lookahead so the match itself ends at the keyword. A page that
+# prints "Published: 6 January 2026 Last updated: 20 March 2026" as two stacked
+# lines collapses to one line of text once the tags are stripped, and a
+# consuming capture swallowed the second label with the first date, reporting
 # the older of the two as the page's date.
+#
+# Longest first, so "last updated" is not matched as "updated" and "última
+# atualização" is not matched as "atualizado".
+_DATE_LABELS = "|".join([
+    r"last\s+updated", r"last\s+modified", r"updated\s+on", r"published\s+on",
+    r"published", r"posted", r"updated",
+    r"zuletzt\s+aktualisiert", r"veröffentlicht\s+am", r"aktualisiert\s+am",
+    r"geändert\s+am", r"veröffentlicht", r"aktualisiert",
+    r"derni[èe]re\s+mise\s+[àa]\s+jour", r"mis\s+[àa]\s+jour\s+le",
+    r"mis\s+[àa]\s+jour", r"publi[ée]\s+le", r"modifi[ée]\s+le",
+    r"[úu]ltima\s+actualizaci[óo]n", r"actualizado\s+el", r"publicado\s+el",
+    r"modificado\s+el", r"actualizado", r"publicado",
+    r"[úu]ltima\s+atualiza[çc][ãa]o", r"atualizado\s+em", r"publicado\s+em",
+    r"ultimo\s+aggiornamento", r"aggiornato\s+il", r"pubblicato\s+il",
+    r"laatst\s+bijgewerkt", r"bijgewerkt\s+op", r"gepubliceerd\s+op",
+    r"senast\s+uppdaterad", r"uppdaterad", r"publicerad",
+    r"sist\s+oppdatert", r"oppdatert", r"publisert",
+    r"senest\s+opdateret", r"opdateret", r"offentliggjort",
+    r"p[äa]ivitetty", r"julkaistu",
+    r"son\s+g[üu]ncelleme", r"g[üu]ncellendi", r"yay[ıi]nland[ıi]",
+    r"ultima\s+actualizare", r"actualizat", r"publicat",
+])
+
 _TEXT_DATE_RE = re.compile(
-    r"(last\s+updated|last\s+modified|updated\s+on|published|posted)\s*[:\-–]?\s*"
-    r"(?=([0-9A-Za-z][^<\n|·•]{5,24}))", re.I)
+    r"(%s)\s*[:\-–]?\s*(?=([0-9%s][^<\n|·•]{5,32}))" % (_DATE_LABELS, _L[1:-1]),
+    re.I | re.U)
 
 
 def page_date_signals(html, headers, now, text=None):
