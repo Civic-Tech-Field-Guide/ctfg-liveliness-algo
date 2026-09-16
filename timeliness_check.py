@@ -1838,6 +1838,110 @@ def render_page_text(url):
                 pass
 
 
+# ── Reading a page the rules cannot settle ────────────────────────────────────
+#
+# Some questions do not reduce to a keyword. A conference closes registration
+# because it is about to happen; a consultation closes because it is over. Both
+# write "closed" on the page, and a subject list that tells them apart for one
+# gets the other wrong: a list containing "registration" retired a live
+# conference, and removing it lost a genuinely finished initiative whose page
+# said "Public voting closed on December 31, 2021".
+#
+# So the narrow cases go to a model, and only those. It is asked one question
+# about one page, its answer is quoted into the public breakdown next to
+# everything else, and it can decline. Fewer than one listing in twenty reaches
+# it. Everything the deterministic checks can settle is settled without it,
+# because a score a project can contest has to rest on something a project can
+# inspect.
+
+ADJUDICATE          = os.environ.get("ADJUDICATE", "1") != "0"
+ADJUDICATE_MODEL    = "claude-opus-5"
+ADJUDICATE_MAX_RUN  = int(os.environ.get("ADJUDICATE_MAX_RUN", "60"))
+ADJUDICATE_PAGE_CAP = 6000
+
+_adjudications = 0
+
+_ADJUDICATE_SYSTEM = """You read the homepage of a civic technology project and answer one \
+question: has the project itself finished?
+
+Finished means the thing the listing is about has ended and will not resume. A page saying \
+an organisation has wound down, a consultation has closed, a programme has run its course or \
+a service has been retired is finished.
+
+It is NOT finished when only an intake window has closed. Registration closing, applications \
+closing, a submission deadline passing, nominations closing or voting for one round ending \
+are all routine events on a project that is running, and a recurring event closes \
+registration precisely because it is about to take place.
+
+Say "unclear" whenever the page does not settle it. Unclear is the right answer for most \
+pages and carries no penalty: something else decides those. Only answer "finished" on \
+wording that states it, and quote that wording exactly as it appears."""
+
+
+def adjudicate_finished(name, url, text):
+    """
+    Ask whether a page says the project itself has finished.
+
+    Returns (verdict, evidence, reason) with verdict one of "finished",
+    "running" or "unclear", or (None, None, None) when no call was made.
+    Every failure returns the None form: no key, no package, a refusal, a
+    malformed answer or the per-run cap. A listing then falls back to whatever
+    the deterministic checks made of it, which is what happened before this
+    existed.
+    """
+    global _adjudications
+    if not (ADJUDICATE and text and text.strip()):
+        return None, None, None
+    if _adjudications >= ADJUDICATE_MAX_RUN:
+        return None, None, None
+    try:
+        import anthropic
+    except ImportError:
+        return None, None, None
+
+    try:
+        client = anthropic.Anthropic()
+        _adjudications += 1
+        response = client.messages.create(
+            model=ADJUDICATE_MODEL,
+            max_tokens=1000,
+            system=_ADJUDICATE_SYSTEM,
+            output_config={
+                "effort": "low",          # one narrow question about one page
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "verdict":  {"type": "string",
+                                         "enum": ["finished", "running", "unclear"]},
+                            "evidence": {"type": "string"},
+                            "reason":   {"type": "string"},
+                        },
+                        "required": ["verdict", "evidence", "reason"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            messages=[{"role": "user", "content":
+                       "Project: %s\nAddress: %s\n\nPage text:\n%s"
+                       % (name, url, text[:ADJUDICATE_PAGE_CAP])}],
+        )
+        if response.stop_reason == "refusal":
+            return None, None, None
+        raw = next((b.text for b in response.content if b.type == "text"), None)
+        if not raw:
+            return None, None, None
+        data = json.loads(raw)
+        verdict = data.get("verdict")
+        if verdict not in ("finished", "running", "unclear"):
+            return None, None, None
+        return verdict, (data.get("evidence") or "")[:160], (data.get("reason") or "")[:200]
+    except Exception as e:
+        print(f"    adjudicate → unavailable ({type(e).__name__})")
+        return None, None, None
+
+
 # ── Pages that say the thing is over ──────────────────────────────────────────
 #
 # A date is not automatically a sign of life. "This questionnaire closed on
@@ -2147,6 +2251,7 @@ def compute_liveliness(rec):
     page_copyright_year = None
     page_unreadable = False
     page_closed, page_closed_phrase = False, None
+    adjudicated = False
     if website_url and website_alive is True:
         page_html, page_headers = get_page_cached(website_url)
         if page_html:
@@ -2178,6 +2283,18 @@ def compute_liveliness(rec):
             page_closed, page_closed_phrase = page_says_closed(page_html, now, text=rendered)
             if page_closed:
                 print(f"    page     → says it has closed: {page_closed_phrase!r}")
+            elif not page_unreadable and not page_signals:
+                # The wording check found nothing and neither did any date. This
+                # is the narrow band the rules cannot settle, so it is the only
+                # band worth asking about.
+                words = rendered if rendered is not None else readable
+                verdict, evidence, reason = adjudicate_finished(name, website_url, words)
+                if verdict:
+                    print(f"    adjudicate → {verdict}: {evidence!r}")
+                if verdict == "finished":
+                    page_closed = True
+                    page_closed_phrase = evidence or reason
+                    adjudicated = True
             if page_unreadable:
                 print(f"    page     → still unread after rendering")
             else:
@@ -2331,10 +2448,15 @@ def compute_liveliness(rec):
     if page_closed:
         before = score
         score  = min(score, CLOSED_CAP)
-        why.append("The project's own page says it has finished (\"%s\"), so it is not "
-                   "scored on how recently that page changed%s"
-                   % (page_closed_phrase,
-                      "" if score == before else " (capped at %g)" % CLOSED_CAP))
+        # Where the finding came from is part of the finding. A wording match is
+        # a rule anyone can check; a reading is a judgement, and the breakdown
+        # says which one this was so a project disputing it knows what to argue
+        # with.
+        source = ("A reading of the project's own page finds" if adjudicated
+                  else "The project's own page says")
+        capped = "" if score == before else " (capped at %g)" % CLOSED_CAP
+        why.append('%s it has finished ("%s"), so it is not scored on how recently '
+                   'that page changed%s' % (source, page_closed_phrase, capped))
 
     # Fully unknown: nothing could be checked at all
     no_signals = (best_date is None and website_alive is None and accessible_count == 0)

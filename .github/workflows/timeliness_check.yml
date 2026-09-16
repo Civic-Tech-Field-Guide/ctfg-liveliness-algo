@@ -45,4 +45,9 @@ jobs:
           AIRTABLE_PAT:    ${{ secrets.AIRTABLE_PAT }}
           GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}  # built-in ephemeral token; read-only per permissions block
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          # Only the handful of listings the rules cannot settle reach the model,
+          # capped per run by ADJUDICATE_MAX_RUN. Unset the secret, or set
+          # ADJUDICATE=0, and those listings fall back to the deterministic
+          # reading exactly as before.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python timeliness_check.py
