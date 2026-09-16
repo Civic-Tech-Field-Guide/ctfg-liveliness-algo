@@ -31,6 +31,7 @@ import os
 import sys
 import re
 import signal
+import socket
 import time
 import json
 from datetime import datetime, timedelta, timezone
@@ -750,6 +751,82 @@ def check_website(url):
 # nearest the project's last known activity rather than the newest (the newest is
 # often already a parked-domain page) and rate-limits itself to Wayback's ~15
 # requests/minute. Nothing in this scorer should reintroduce it.
+
+
+# ── Telling a dead project from a moved page ──────────────────────────────────
+#
+# A failed fetch is not one finding, it is several, and they call for opposite
+# rulings. The host not resolving at all means the thing is gone. The listed
+# page answering 404 while its own host answers fine means the page moved and
+# the organisation carried on, which the codebook calls a relink and which is
+# the commonest case of the two. Scoring both as "website did not respond" and
+# subtracting 50 buries the difference, and the relink cases are exactly the
+# listings most worth keeping, since only the link is stale.
+#
+# Three listings out of ten sampled on 2026-09-16 were relinks: an EU
+# competition whose host moved to op.europa.eu, a UNICEF feature page, and a
+# Response Innovation Lab country page. All three organisations were live.
+
+RELINK_PENALTY = 15   # the listed page is gone, but the site it sat on is not
+
+
+def host_resolves(url):
+    """
+    False only when the hostname genuinely does not resolve.
+
+    A dangling CNAME looks like this: the record exists and points somewhere
+    that no longer does, so a lookup succeeds with no address. Any error other
+    than "no such host" is treated as unknown rather than absent, since a
+    resolver problem is not evidence about the project.
+    """
+    host = (urlparse(url).hostname or "").strip()
+    if not host:
+        return None
+    try:
+        socket.getaddrinfo(host, None)
+        return True
+    except socket.gaierror:
+        return False
+    except Exception:
+        return None
+
+
+def site_root(url):
+    """The scheme and host of a URL, or None when it has no path of its own."""
+    p = urlparse(url)
+    if not p.netloc or p.path.strip("/") == "":
+        return None
+    return "%s://%s/" % (p.scheme or "https", p.netloc)
+
+
+def probe_site(url):
+    """
+    What a failed fetch actually means.
+
+    Returns (alive, archived, verdict) where verdict is one of:
+      "ok"         the listed page answered
+      "relink"     the page is gone but its host answers, so the link is stale
+                   rather than the project being over
+      "no-host"    the hostname does not resolve
+      "gone"       the page failed and its host gives nothing better
+      "unknown"    nothing could be determined
+    """
+    alive, archived = check_website(url)
+    if alive is True:
+        return True, archived, "ok"
+    if alive is None:
+        return None, archived, "unknown"
+
+    if host_resolves(url) is False:
+        return False, archived, "no-host"
+
+    root = site_root(url)
+    if root:
+        root_alive, _ = check_website(root)
+        if root_alive is True:
+            return None, archived, "relink"
+
+    return False, archived, "gone"
 
 
 class GitHubRateLimited(Exception):
@@ -1952,20 +2029,20 @@ def compute_liveliness(rec):
 
     if url_class == "skip":
         print(f"    website  → no usable URL ({(raw_url or 'none')[:60]})")
-        website_alive, is_archived = None, False
+        website_alive, is_archived, site_verdict = None, False, "unknown"
     elif url_class == "article":
         print(f"    website  → article URL detected, searching for homepage…")
         discovered_url = find_homepage_in_article(raw_url)
         if discovered_url:
             print(f"    website  → found homepage: {discovered_url}")
             website_url = discovered_url
-            website_alive, is_archived = check_website(discovered_url)
+            website_alive, is_archived, site_verdict = probe_site(discovered_url)
         else:
             print(f"    website  → could not find homepage from article")
-            website_alive, is_archived = None, False
+            website_alive, is_archived, site_verdict = None, False, "unknown"
     else:
-        website_alive, is_archived = check_website(raw_url)
-        print(f"    website  → alive={website_alive}  archived={is_archived}")
+        website_alive, is_archived, site_verdict = probe_site(raw_url)
+        print(f"    website  → alive={website_alive}  archived={is_archived}  {site_verdict}")
 
     # A dead site is NOT looked up in the Wayback Machine and its Website URL is
     # never replaced with a snapshot. Swapping in an archive link is the
@@ -2159,6 +2236,20 @@ def compute_liveliness(rec):
             else "Website is responding, but nothing dated and recent was found to go "
                  "with it",
             bonus, score - before))
+    elif site_verdict == "relink":
+        # The page is gone and its host is not. That is a stale link, not a
+        # dead project, and the two want opposite rulings, so it takes a much
+        # smaller penalty and says what a curator has to decide.
+        before = score
+        score  = max(score - RELINK_PENALTY, 0)
+        why.append(_adjustment(
+            "The page listed here is gone, but the site it sat on still answers, so "
+            "the link needs checking rather than the project being counted as over",
+            -RELINK_PENALTY, score - before))
+    elif site_verdict == "no-host":
+        before = score
+        score  = max(score - 50, 0)
+        why.append(_adjustment("The web address does not exist any more", -50, score - before))
     elif website_alive is False:
         before = score
         score  = max(score - 50, 0)  # strong signal of death
@@ -2279,7 +2370,11 @@ def compute_liveliness(rec):
     # exists precisely so that case does not have to collapse into a binary.
     if status == "Inactive":
         says_finished = page_closed
-        unreachable   = (website_alive is False) or is_archived or no_signals
+        # A relink is the one failure that is explicitly not a verdict: the
+        # organisation is still answering and only the link is stale, which is
+        # a curator's call to make and not one to write permanently.
+        unreachable   = ((website_alive is False) or is_archived or no_signals) \
+                        and site_verdict != "relink"
 
         # A single failed fetch is not proof a site has gone. _try_fetch()
         # already retries a connection error once, and a blip lasting seconds
