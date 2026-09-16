@@ -322,11 +322,36 @@ def fetch_batch():
     return eligible[:BATCH_SIZE]
 
 
+# Types that mean something is still running, whatever else sits on the record.
+# This is ONGOING_TYPES from the curator's lib/project-status.mjs, which applies
+# the same rule on the same taxonomy wherever a status is written from that side
+# — the curator's save, its suggestions, the bulk importer. The two lists have
+# to agree, or a listing's status depends on which tool reached it last.
+# Legislation is here on purpose: a law is in force or it is repealed, so it
+# takes Active or Inactive like anything else rather than N/A.
+ONGOING_TYPES = {
+    "project", "organization", "tool or platform", "campaign", "media", "event",
+    "network", "program", "space", "publication", "database", "course", "game",
+    "legislation",
+}
+
+
 def is_na_candidate(rec):
     """Returns True if record should be marked N/A (books format or document type)."""
     f = rec.get("fields", {})
     type_values = f.get(F_TYPE) or []
-    if any("document" in str(t).lower() for t in type_values):
+    names = [str(t.get("name") if isinstance(t, dict) else t).strip().lower()
+             for t in type_values]
+
+    # A finished piece of work is only finished when nothing ongoing sits beside
+    # it. A record typed Organization + Document is an organization that
+    # published something, and the organization is still there; without this the
+    # rule reads the document and retires the organization. Same for a body that
+    # published a book.
+    if any(n in ONGOING_TYPES for n in names):
+        return False
+
+    if any("document" in n for n in names):
         return True
     format_ids = f.get(F_FORMATS) or []
     format_names = get_format_names()
