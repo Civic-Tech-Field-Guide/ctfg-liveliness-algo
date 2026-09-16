@@ -1772,9 +1772,16 @@ def render_page_text(url):
 # explicitly, and the generic patterns underneath require the sentence to be
 # about the thing itself having ended.
 
-_CLOSED_SUBJECTS = (r"questionnaire|survey|consultation|call for [a-z ]{3,20}|application[s]?|"
-                    r"submission[s]?|registration|nomination[s]?|entries|voting|poll|"
-                    r"programme|program|project|pilot|competition|contest|challenge|fund")
+# Only subjects whose closing means the thing itself is over. An intake window
+# shutting says nothing: a healthy conference closes registration precisely
+# because it is about to happen, and TrustCon was driven from 45 to 10 by its
+# own "Registration is Closed" banner while the site served fine and its footer
+# read 2026. Applications, nominations, entries, submissions, voting and
+# registration all close on schedule every year on programmes that are running,
+# so none of them belongs here.
+_CLOSED_SUBJECTS = (r"questionnaire|survey|consultation|"
+                    r"programme|program|project|pilot|initiative|campaign|"
+                    r"competition|contest|challenge|fund|service|platform|tool|site")
 
 _CLOSURE_PATTERNS = [
     # "This questionnaire closed on July 2, 2026" / "applications closed 1 March 2025"
@@ -1782,8 +1789,8 @@ _CLOSURE_PATTERNS = [
                r"(?:now )?(?:closed|ended|finished|concluded)\b" % _CLOSED_SUBJECTS, re.I),
     # "no longer accepting submissions", "we are no longer taking applications"
     re.compile(r"\bno longer (?:accepting|taking|open to|receiving)\b", re.I),
-    # "the deadline has passed", "submission deadline passed"
-    re.compile(r"\bdeadline (?:has )?(?:passed|expired)\b", re.I),
+    # A passed deadline is an intake window closing, not the thing ending, so it
+    # is no longer read as a closure on its own.
     # "this project has ended", "the programme is now closed"
     re.compile(r"\bthis (?:project|programme|program|pilot|initiative|campaign)\s+"
                r"(?:has |had )?(?:ended|closed|finished|concluded|wound down)\b", re.I),
@@ -2256,6 +2263,25 @@ def compute_liveliness(rec):
     score  = round(score, 1)
     activity_status = "Unknown" if unknown else score_to_activity_status(score)
     status          = None      if unknown else score_to_status(score)
+
+    # Status "Inactive" is a claim that the thing is over, so it needs one of
+    # two kinds of evidence: it cannot be reached, or it says itself that it has
+    # finished. A page announcing that it has closed is the clearest signal
+    # there is and counts on its own, whatever the site still serves.
+    #
+    # Age is not that evidence. Plenty of listings are static resources — a
+    # guide, a dataset, a reference site — unchanged for years and perfectly
+    # usable because they are still up. A low score is the right reading of how
+    # much is happening there, and Activity status keeps carrying it; the score
+    # exists precisely so that case does not have to collapse into a binary.
+    if status == "Inactive":
+        says_finished = page_closed
+        unreachable   = (website_alive is False) or is_archived or no_signals
+        if not (says_finished or unreachable):
+            why.append("The score is low, but the site still answers and nothing on it "
+                       "says the project has finished, so it is not recorded as "
+                       "inactive: a resource that is still up is still usable")
+            status = None
     if unknown:
         score = None            # clears the field rather than publishing a number
 
