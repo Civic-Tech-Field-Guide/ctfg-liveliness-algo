@@ -445,7 +445,19 @@ def restore_scored_wrong():
 
 
 def fetch_na_candidates():
-    """Return records with books format or document type that aren't yet marked N/A."""
+    """
+    Records that should be N/A, from the first page of the table only.
+
+    One page of 100 against roughly 16,000 rows, which is where this rule used
+    to live entirely. A report typed Document sat outside that page, never got
+    looked at, and was scored Inactive by the ordinary run instead: the rule was
+    right and simply never saw the record. The rule is now applied to every
+    record as it is scored, in compute_liveliness(), which is where it belongs,
+    because being a finished piece of work is a property of the record rather
+    than of where it happens to fall in a listing.
+
+    This stays as a sweep for records that never come up for scoring at all.
+    """
     data = at_get(LISTINGS_TABLE, {
         "filterByFormula": (
             f'NOT(OR({{{_field_name(F_STATUS)}}} = "N/A",'
@@ -2726,6 +2738,21 @@ def compute_liveliness(rec):
     score  = round(score, 1)
     activity_status = "Unknown" if unknown else score_to_activity_status(score)
     status          = None      if unknown else score_to_status(score)
+
+    # A finished piece of work is N/A, and it outranks anything the signals say.
+    # A report does not stop being a report because the site hosting it went
+    # down, and Inactive on one reads as a project that ended, which is a claim
+    # about something that was never running in the first place. This used to be
+    # decided only by a sweep over the first hundred rows of the table, so a
+    # report outside that page was scored like a project and retired like one.
+    #
+    # is_na_candidate() carries the guard that keeps an organization which
+    # published something out of this: an ongoing type beside the Document wins.
+    if is_na_candidate(rec):
+        status = "N/A"
+        why.append("This listing is a finished piece of work rather than something "
+                   "that runs, so it is recorded as not applicable instead of being "
+                   "scored on how recently anything happened")
 
     # Status "Inactive" is a claim that the thing is over, so it needs one of
     # two kinds of evidence: it cannot be reached, or it says itself that it has
