@@ -133,28 +133,65 @@ AT_HEADERS = {
 }
 
 
+# Airtable answers slowly often enough that a run long enough to matter will
+# meet it. A single read that took more than ten seconds killed a 1,028-record
+# run after three records: nothing retried it, and nothing in the record loop
+# caught it either, so a blip lasting seconds discarded a pass that had two and
+# a half hours of work left in it.
+#
+# So every call to Airtable is retried. Only on the failures that are worth
+# retrying: a connection that dropped, a read that timed out, a 429, and the
+# 5xx family. A 401, a 404 or a malformed request are answers, not blips, and
+# repeating them only wastes the budget.
+AT_RETRY_ON_STATUS = {429, 500, 502, 503, 504}
+AT_ATTEMPTS        = 4
+AT_BACKOFF_S       = 2          # doubles each attempt: 2, 4, 8
+
+
+def _at_request(method, url, **kwargs):
+    """One Airtable call, retried through the failures that pass on their own."""
+    kwargs.setdefault("timeout", 20)
+    last = None
+    for attempt in range(1, AT_ATTEMPTS + 1):
+        try:
+            r = requests.request(method, url, headers=AT_HEADERS, **kwargs)
+            if r.status_code in AT_RETRY_ON_STATUS and attempt < AT_ATTEMPTS:
+                # Airtable asks for a 30s cooldown on a 429 and says so in the
+                # header when it sets one; believe it rather than the backoff.
+                wait = float(r.headers.get("Retry-After") or 0) or AT_BACKOFF_S * 2 ** (attempt - 1)
+                print(f"    airtable → {r.status_code}, retrying in {wait:g}s "
+                      f"(attempt {attempt} of {AT_ATTEMPTS})")
+                time.sleep(wait)
+                continue
+            return r
+        except requests.RequestException as e:
+            last = e
+            if attempt == AT_ATTEMPTS:
+                break
+            wait = AT_BACKOFF_S * 2 ** (attempt - 1)
+            print(f"    airtable → {type(e).__name__}, retrying in {wait:g}s "
+                  f"(attempt {attempt} of {AT_ATTEMPTS})")
+            time.sleep(wait)
+    raise last if last else requests.RequestException("airtable: retries exhausted")
+
+
 def at_get(table, params):
     params = {**params, "returnFieldsByFieldId": "true"}
-    r = requests.get(f"{AT_BASE}/{table}", headers=AT_HEADERS, params=params, timeout=15)
+    r = _at_request("GET", f"{AT_BASE}/{table}", params=params)
     r.raise_for_status()
     return r.json()
 
 
 def at_get_record(table, record_id):
-    r = requests.get(f"{AT_BASE}/{table}/{record_id}", headers=AT_HEADERS,
-                     params={"returnFieldsByFieldId": "true"}, timeout=10)
+    r = _at_request("GET", f"{AT_BASE}/{table}/{record_id}",
+                    params={"returnFieldsByFieldId": "true"})
     if r.status_code == 200:
         return r.json()
     return None
 
 
 def at_patch(table, records):
-    r = requests.patch(
-        f"{AT_BASE}/{table}",
-        headers=AT_HEADERS,
-        json={"records": records},
-        timeout=15,
-    )
+    r = _at_request("PATCH", f"{AT_BASE}/{table}", json={"records": records})
     r.raise_for_status()
     return r.json()
 
@@ -2791,6 +2828,7 @@ def main():
     today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     updates      = []
     queued       = 0
+    failed       = []
     rate_limited = False
 
     signal.signal(signal.SIGALRM, _record_timeout_handler)
@@ -2803,6 +2841,17 @@ def main():
             name = rec.get("fields", {}).get(F_NAME, rec["id"])
             print(f"\n  [{name}] ✗ exceeded {RECORD_TIME_BUDGET_S}s budget — marking checked without a score")
             result = None
+        except requests.RequestException as e:
+            # The network gave out on this record after its retries. One record
+            # is not worth the other thousand: it is left unstamped so it stays
+            # in the queue, and the run carries on. Nothing is written for it,
+            # deliberately, since a Last timeliness check with no score would
+            # advance the queue past a record nobody actually checked.
+            name = rec.get("fields", {}).get(F_NAME, rec["id"])
+            print(f"\n  [{name}] ✗ network failed ({type(e).__name__}) — skipped, "
+                  f"left in the queue")
+            failed.append((rec["id"], name, type(e).__name__))
+            continue
         except GitHubRateLimited as e:
             name = rec.get("fields", {}).get(F_NAME, rec["id"])
             print(f"\n  [{name}] ✗ {e} — stopping the run")
@@ -2866,6 +2915,15 @@ def main():
         print(f"\n✓ Done — {len(updates)} record(s) scored, none written.\n")
     else:
         print(f"\n✓ Done — {len(updates)} record(s) written.\n")
+
+    if failed:
+        print(f"{len(failed)} record(s) were skipped because the network failed on them. "
+              f"They keep their place in the queue:")
+        for rid, name, why in failed[:20]:
+            print(f"  {rid}  {name} ({why})")
+        if len(failed) > 20:
+            print(f"  ... and {len(failed) - 20} more")
+        print()
 
     if queued:
         print(f"{queued} page(s) the rules could not settle were queued to "
