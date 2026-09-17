@@ -758,13 +758,20 @@ def _try_fetch(url, attempt=1):
 
 def check_website(url):
     """
-    Returns (is_alive: bool | None, is_archived: bool).
+    Returns (is_alive: bool | None, is_archived: bool, reason: str | None).
+
     For web archive URLs, tries the original URL first; only treats as
     archived/dead if the original URL also fails.
     None means we couldn't determine (timeout / network error).
+
+    `reason` carries _try_fetch()'s word for why, and the one that matters is
+    "blocked": a 403 or 429 is a wall in front of the page, not a fact about
+    the project, and a browser gets past most of them. A timeout is not the
+    same thing and reading it the same way would send us to render sites that
+    are simply slow.
     """
     if not url:
-        return None, False
+        return None, False, None
 
     is_archive_url = is_archive_host(url)
 
@@ -772,15 +779,16 @@ def check_website(url):
         original = _extract_archive_original(url)
         if original:
             print(f"    website  → archive URL, trying original: {original[:60]}")
-            alive, _ = _try_fetch(original)
+            alive, why = _try_fetch(original)
             if alive is True:
-                return True, False   # original site is live — not archived
+                return True, False, None   # original site is live — not archived
             if alive is None:
-                return None, True    # couldn't determine
+                return None, True, why     # couldn't determine
         # Original is down or couldn't be extracted — genuinely archived
-        return False, True
+        return False, True, None
 
-    return _try_fetch(url)[0], False
+    alive, why = _try_fetch(url)
+    return alive, False, why
 
 
 # find_wayback_url() was removed with the Website URL replacement it fed. Picking
@@ -848,18 +856,19 @@ def probe_site(url):
       "gone"       the page failed and its host gives nothing better
       "unknown"    nothing could be determined
     """
-    alive, archived = check_website(url)
+    alive, archived, why = check_website(url)
     if alive is True:
         return True, archived, "ok"
     if alive is None:
-        return None, archived, "unknown"
+        # A wall is worth another attempt through a browser; a timeout is not.
+        return None, archived, "blocked" if why == "blocked" else "unknown"
 
     if host_resolves(url) is False:
         return False, archived, "no-host"
 
     root = site_root(url)
     if root:
-        root_alive, _ = check_website(root)
+        root_alive, _, _ = check_website(root)
         if root_alive is True:
             return None, archived, "relink"
 
@@ -1927,6 +1936,35 @@ RENDER_GOTO_MS    = 15_000
 RENDER_SETTLE_MS  = 2_500
 RENDER_TEXT_CAP   = 12_000
 
+# Headless Chromium says so in its own User-Agent, and a great many WAFs refuse
+# on that string alone. Measured on 20 sites that each returned 403 to a plain
+# fetch: with Playwright's default User-Agent, 6 of 20 rendered real content;
+# with this one, 13 of 20. The only difference is not announcing ourselves as a
+# headless browser. Nothing else here is disguised, the crawler is not pretending
+# to be a person, and a site that still says no is left alone.
+RENDER_USER_AGENT = os.environ.get(
+    "RENDER_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+
+# The wall's own words. A challenge page is not short: the five that stayed
+# blocked in that test rendered between 256 and 686 characters, all of it above
+# MIN_READABLE_PAGE_CHARS, so length cannot tell a wall from a page. Reading one
+# as the project's own text would score Cloudflare's copyright year and
+# Cloudflare's wording as the project's.
+_BOT_WALL_RE = re.compile(
+    r"just a moment|checking your browser|enable javascript and cookies|"
+    r"verify (?:you are human|yourself)|are you a robot|access denied|"
+    r"attention required|performing security verification|"
+    r"you have been blocked|unusual traffic|ddos protection|"
+    r"request unsuccessful|pardon our interruption|"
+    r"security service to protect", re.I)
+
+
+def looks_like_bot_wall(text):
+    """True when the rendered text is the challenge page rather than the site."""
+    return bool(text) and bool(_BOT_WALL_RE.search(text[:1500]))
+
 _BROWSER = None
 _BROWSER_FAILED = False
 _PLAYWRIGHT = None
@@ -1986,7 +2024,7 @@ def render_page_text(url):
         return None
     page = None
     try:
-        page = browser.new_page()
+        page = browser.new_page(user_agent=RENDER_USER_AGENT)
 
         def _route(route):
             # Both calls have to swallow their own errors. A route that has
@@ -2409,23 +2447,53 @@ def compute_liveliness(rec):
     page_unreadable = False
     page_closed, page_closed_phrase = False, None
     pending_adjudication = None
+
+    # A site behind a bot wall answered 403 or 429, which is the wall talking
+    # and says nothing about the project. Roughly two thirds of them serve their
+    # real page to a browser, so those get one, and what comes back is only
+    # believed when it is not the challenge page itself. A site that still says
+    # no stays exactly where it was: unread, and recorded as unread.
+    #
+    # This is the only place the browser is used on a page that did not answer.
+    # It is deliberately not extended to a timeout or a connection error, where
+    # there is nothing to render and the wait would be paid twice.
+    blocked_text = None
+    if website_url and site_verdict == "blocked" and not is_archived:
+        print(f"    website  → behind a bot check; trying a browser")
+        candidate = render_page_text(website_url)
+        if candidate and looks_like_bot_wall(candidate):
+            print(f"    render   → got the bot wall, not the site; left unread")
+        elif candidate and len(candidate) >= MIN_READABLE_PAGE_CHARS:
+            blocked_text = candidate
+            website_alive = True
+            print(f"    render   → {len(candidate)} chars past the wall")
+        elif candidate:
+            print(f"    render   → only {len(candidate)} chars past the wall; left unread")
+
     if website_url and website_alive is True:
         page_html, page_headers = get_page_cached(website_url)
-        if page_html:
+        # A page reached only through the browser has no HTML here: the fetch
+        # that would have filled the cache is the one the wall refused. Its
+        # rendered words are all there is, so they stand in for the page and the
+        # markup-based checks below simply find nothing, which is accurate.
+        if page_html is None and blocked_text:
+            page_html, page_headers = "", {}
+        if page_html is not None:
             # A site can answer and still say nothing. An app that paints itself
             # in the browser serves a shell: the questionnaire, the dates, the
             # notice that it closed months ago all arrive with the JavaScript,
             # and none of it is in the HTML. Reading no date off a shell is not
             # the same finding as reading no date off a page, so it is recorded
             # as its own fact rather than left to look like an absence.
-            readable = readable_page(page_html)["text"]
+            readable = blocked_text or readable_page(page_html)["text"]
             page_unreadable = len(readable) < MIN_READABLE_PAGE_CHARS
 
             # A shell is worth a second look through a browser, where the words
             # actually exist. Only a shell: the nine in ten pages that already
-            # read fine would pay for a render that told us nothing new.
-            rendered = None
-            if page_unreadable and not is_archived:
+            # read fine would pay for a render that told us nothing new. A page
+            # already rendered past a wall is not re-rendered.
+            rendered = blocked_text
+            if blocked_text is None and page_unreadable and not is_archived:
                 print(f"    page     → only {len(readable)} chars of text; rendering")
                 rendered = render_page_text(website_url)
                 if rendered and len(rendered) >= MIN_READABLE_PAGE_CHARS:
@@ -2532,6 +2600,13 @@ def compute_liveliness(rec):
         why.append("No website address on this listing to check")
     elif url_class == "skip":
         why.append("The listed address is not one that can be checked")
+    elif site_verdict == "blocked":
+        # Said out loud because it is a fact about the wall, not about the
+        # project, and a reader comparing two low scores should be able to tell
+        # "we could not look" from "we looked and found nothing".
+        why.append("The site is behind a bot check that refused both an ordinary "
+                   "request and a browser, so nothing on it could be read. This is "
+                   "not evidence either way about the project")
     else:
         why.append("Website could not be checked: it timed out or refused the request")
 
@@ -2655,7 +2730,7 @@ def compute_liveliness(rec):
         # Inactive pay for it.
         if unreachable and website_alive is False and website_url:
             time.sleep(RECHECK_PAUSE_S)
-            again, _ = check_website(website_url)
+            again, _, _ = check_website(website_url)
             if again is not False:
                 why.append("The website did not answer when it was first checked but "
                            "answered when it was tried again, so this is not recorded "
@@ -2703,7 +2778,15 @@ def compute_liveliness(rec):
     if unknown:
         score = None            # clears the field rather than publishing a number
 
-    if no_signals and is_archived:
+    if no_signals and site_verdict == "blocked":
+        # Distinct from the message below it on purpose. "No working website
+        # address" is false here: the address works and a wall is standing in
+        # front of it, which is a different thing for a curator to act on.
+        why = ["The website is behind a bot check that refused both an ordinary "
+               "request and a browser, and there is no code repository, feed or "
+               "reachable social account to go on instead. Nothing here is "
+               "evidence about whether the project is running."]
+    elif no_signals and is_archived:
         why = ["The address on this listing is an archive snapshot, and the original "
                "could not be reached to see whether the project is still there."]
     elif no_signals:
