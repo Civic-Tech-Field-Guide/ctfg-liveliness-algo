@@ -183,6 +183,36 @@ def at_get(table, params):
     return r.json()
 
 
+AT_MAX_PAGES = 100  # 10,000 rows at Airtable's 100-row page cap
+
+
+def at_get_all(table, params=None):
+    """
+    Every row in a table, paged. Returns (records, complete).
+
+    Airtable caps a page at 100 rows and says nothing when it truncates: a table
+    of 510 read with one call comes back as 100 rows that look like the whole
+    table. A lookup map built from that silently answers "not found" for four
+    fifths of the base, and the callers below turn "not found" into "this record
+    is not in the graveyard", which puts a retired listing back in the sweep.
+    So the count matters, and so does knowing it is the real count, which is
+    what the second return value is for.
+    """
+    records, offset = [], None
+    for _ in range(AT_MAX_PAGES):
+        page_params = {**(params or {}), "pageSize": 100}
+        if offset:
+            page_params["offset"] = offset
+        data = at_get(table, page_params)
+        records.extend(data.get("records", []))
+        offset = data.get("offset")
+        if not offset:
+            return records, True
+    print(f"  Warning: {table} has more than {AT_MAX_PAGES} pages, so this read stopped "
+          f"short at {len(records)} rows.", file=sys.stderr)
+    return records, False
+
+
 def at_get_record(table, record_id):
     r = _at_request("GET", f"{AT_BASE}/{table}/{record_id}",
                     params={"returnFieldsByFieldId": "true"})
@@ -217,13 +247,20 @@ def get_format_names():
     if _format_name_cache is not None:
         return _format_name_cache
     try:
-        data = at_get(FORMAT_TABLE, {"pageSize": 100})
+        records, complete = at_get_all(FORMAT_TABLE)
         _format_name_cache = {
             rec["id"]: (rec.get("fields", {}).get(FORMAT_F_NAME) or "").strip().lower()
-            for rec in data.get("records", [])
+            for rec in records
         }
+        if not complete:
+            print("  Warning: the Format map is short, so the books rule will miss some "
+                  "records and they will be scored instead of skipped.", file=sys.stderr)
     except Exception as e:
-        print(f"  Warning: could not fetch Format table: {e}", file=sys.stderr)
+        # An empty map is not a neutral fallback: every format id then reads as
+        # "not books" and the rule stops excluding anything. Said plainly here
+        # because the run carries on and the sweep's output will not show it.
+        print(f"  Warning: could not fetch Format table: {e}\n"
+              f"  The books exclusion will not fire on this run.", file=sys.stderr)
         _format_name_cache = {}
     return _format_name_cache
 
@@ -237,13 +274,19 @@ def get_category_slugs():
     if _category_slug_cache is not None:
         return _category_slug_cache
     try:
-        data = at_get(CATEGORIES_TABLE, {"pageSize": 100})
+        records, complete = at_get_all(CATEGORIES_TABLE)
         _category_slug_cache = {
             rec["id"]: (rec.get("fields", {}).get(CATEGORY_F_SLUG) or "").strip().lower()
-            for rec in data.get("records", [])
+            for rec in records
         }
+        if not complete:
+            print("  Warning: the Categories map is short, so the graveyard rule will miss "
+                  "some records and they will be re-scored.", file=sys.stderr)
     except Exception as e:
-        print(f"  Warning: could not fetch Categories table: {e}", file=sys.stderr)
+        # See the note in get_format_names(): an empty map reads as "nothing is
+        # in the graveyard", which is the opposite of the safe default.
+        print(f"  Warning: could not fetch Categories table: {e}\n"
+              f"  The graveyard exclusion will not fire on this run.", file=sys.stderr)
         _category_slug_cache = {}
     return _category_slug_cache
 
