@@ -6,3 +6,9 @@ __pycache__/
 backfill.log
 .backfill-state*
 .redo-state*
+
+# Run state for the adjudication pass. The queue is a copy of other people's
+# web pages, the ledgers are a record of a particular machine's runs, and
+# neither belongs in the repo. The eval set under eval/ is committed: that one
+# is the measurement, and a number nobody can reproduce is not one.
+adjudication/
