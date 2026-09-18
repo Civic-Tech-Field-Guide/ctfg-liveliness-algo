@@ -31,6 +31,7 @@ import os
 import sys
 import re
 import signal
+import socket
 import time
 import json
 from datetime import datetime, timedelta, timezone
@@ -101,6 +102,7 @@ F_BREAKDOWN       = "fldf1lqGIoBc7qMWF"  # Score breakdown (created 2026-09-08)
 # AS_SCORED_WRONG; the next run restores the record's own Status value and
 # ticks F_FALSE_INACTIVE, which exempts it from all future scoring.
 F_FALSE_INACTIVE  = "fldaMAxokw1rgdwO5"  # False inactive (checkbox)
+F_POSTMORTEM      = "fldTdsLCxLtFaRgdL"  # Postmortem (url) - the page saying why it ended
 AS_SCORED_WRONG   = "Claude scored wrong"
 EXEMPT_SCORE      = 100  # score written to an exempted record
 
@@ -132,9 +134,51 @@ AT_HEADERS = {
 }
 
 
+# Airtable answers slowly often enough that a run long enough to matter will
+# meet it. A single read that took more than ten seconds killed a 1,028-record
+# run after three records: nothing retried it, and nothing in the record loop
+# caught it either, so a blip lasting seconds discarded a pass that had two and
+# a half hours of work left in it.
+#
+# So every call to Airtable is retried. Only on the failures that are worth
+# retrying: a connection that dropped, a read that timed out, a 429, and the
+# 5xx family. A 401, a 404 or a malformed request are answers, not blips, and
+# repeating them only wastes the budget.
+AT_RETRY_ON_STATUS = {429, 500, 502, 503, 504}
+AT_ATTEMPTS        = 4
+AT_BACKOFF_S       = 2          # doubles each attempt: 2, 4, 8
+
+
+def _at_request(method, url, **kwargs):
+    """One Airtable call, retried through the failures that pass on their own."""
+    kwargs.setdefault("timeout", 20)
+    last = None
+    for attempt in range(1, AT_ATTEMPTS + 1):
+        try:
+            r = requests.request(method, url, headers=AT_HEADERS, **kwargs)
+            if r.status_code in AT_RETRY_ON_STATUS and attempt < AT_ATTEMPTS:
+                # Airtable asks for a 30s cooldown on a 429 and says so in the
+                # header when it sets one; believe it rather than the backoff.
+                wait = float(r.headers.get("Retry-After") or 0) or AT_BACKOFF_S * 2 ** (attempt - 1)
+                print(f"    airtable → {r.status_code}, retrying in {wait:g}s "
+                      f"(attempt {attempt} of {AT_ATTEMPTS})")
+                time.sleep(wait)
+                continue
+            return r
+        except requests.RequestException as e:
+            last = e
+            if attempt == AT_ATTEMPTS:
+                break
+            wait = AT_BACKOFF_S * 2 ** (attempt - 1)
+            print(f"    airtable → {type(e).__name__}, retrying in {wait:g}s "
+                  f"(attempt {attempt} of {AT_ATTEMPTS})")
+            time.sleep(wait)
+    raise last if last else requests.RequestException("airtable: retries exhausted")
+
+
 def at_get(table, params):
     params = {**params, "returnFieldsByFieldId": "true"}
-    r = requests.get(f"{AT_BASE}/{table}", headers=AT_HEADERS, params=params, timeout=15)
+    r = _at_request("GET", f"{AT_BASE}/{table}", params=params)
     r.raise_for_status()
     return r.json()
 
@@ -170,20 +214,15 @@ def at_get_all(table, params=None):
 
 
 def at_get_record(table, record_id):
-    r = requests.get(f"{AT_BASE}/{table}/{record_id}", headers=AT_HEADERS,
-                     params={"returnFieldsByFieldId": "true"}, timeout=10)
+    r = _at_request("GET", f"{AT_BASE}/{table}/{record_id}",
+                    params={"returnFieldsByFieldId": "true"})
     if r.status_code == 200:
         return r.json()
     return None
 
 
 def at_patch(table, records):
-    r = requests.patch(
-        f"{AT_BASE}/{table}",
-        headers=AT_HEADERS,
-        json={"records": records},
-        timeout=15,
-    )
+    r = _at_request("PATCH", f"{AT_BASE}/{table}", json={"records": records})
     r.raise_for_status()
     return r.json()
 
@@ -255,7 +294,7 @@ def get_category_slugs():
 def is_excluded(rec):
     """
     Returns True if the record should be skipped:
-    - Already marked Inactive (Status field)
+    - Already marked Inactive or N/A (Status field)
     - Curator has flagged a wrong verdict (False inactive)
     - Category is graveyard
     - New launch this year (marked 'x')
@@ -450,7 +489,19 @@ def restore_scored_wrong():
 
 
 def fetch_na_candidates():
-    """Return records with books format or document type that aren't yet marked N/A."""
+    """
+    Records that should be N/A, from the first page of the table only.
+
+    One page of 100 against roughly 16,000 rows, which is where this rule used
+    to live entirely. A report typed Document sat outside that page, never got
+    looked at, and was scored Inactive by the ordinary run instead: the rule was
+    right and simply never saw the record. The rule is now applied to every
+    record as it is scored, in compute_liveliness(), which is where it belongs,
+    because being a finished piece of work is a property of the record rather
+    than of where it happens to fall in a listing.
+
+    This stays as a sweep for records that never come up for scoring at all.
+    """
     data = at_get(LISTINGS_TABLE, {
         "filterByFormula": (
             f'NOT(OR({{{_field_name(F_STATUS)}}} = "N/A",'
@@ -788,13 +839,20 @@ def _try_fetch(url, attempt=1):
 
 def check_website(url):
     """
-    Returns (is_alive: bool | None, is_archived: bool).
+    Returns (is_alive: bool | None, is_archived: bool, reason: str | None).
+
     For web archive URLs, tries the original URL first; only treats as
     archived/dead if the original URL also fails.
     None means we couldn't determine (timeout / network error).
+
+    `reason` carries _try_fetch()'s word for why, and the one that matters is
+    "blocked": a 403 or 429 is a wall in front of the page, not a fact about
+    the project, and a browser gets past most of them. A timeout is not the
+    same thing and reading it the same way would send us to render sites that
+    are simply slow.
     """
     if not url:
-        return None, False
+        return None, False, None
 
     is_archive_url = is_archive_host(url)
 
@@ -802,15 +860,16 @@ def check_website(url):
         original = _extract_archive_original(url)
         if original:
             print(f"    website  → archive URL, trying original: {original[:60]}")
-            alive, _ = _try_fetch(original)
+            alive, why = _try_fetch(original)
             if alive is True:
-                return True, False   # original site is live — not archived
+                return True, False, None   # original site is live — not archived
             if alive is None:
-                return None, True    # couldn't determine
+                return None, True, why     # couldn't determine
         # Original is down or couldn't be extracted — genuinely archived
-        return False, True
+        return False, True, None
 
-    return _try_fetch(url)[0], False
+    alive, why = _try_fetch(url)
+    return alive, False, why
 
 
 # find_wayback_url() was removed with the Website URL replacement it fed. Picking
@@ -818,6 +877,83 @@ def check_website(url):
 # nearest the project's last known activity rather than the newest (the newest is
 # often already a parked-domain page) and rate-limits itself to Wayback's ~15
 # requests/minute. Nothing in this scorer should reintroduce it.
+
+
+# ── Telling a dead project from a moved page ──────────────────────────────────
+#
+# A failed fetch is not one finding, it is several, and they call for opposite
+# rulings. The host not resolving at all means the thing is gone. The listed
+# page answering 404 while its own host answers fine means the page moved and
+# the organisation carried on, which the codebook calls a relink and which is
+# the commonest case of the two. Scoring both as "website did not respond" and
+# subtracting 50 buries the difference, and the relink cases are exactly the
+# listings most worth keeping, since only the link is stale.
+#
+# Three listings out of ten sampled on 2026-09-16 were relinks: an EU
+# competition whose host moved to op.europa.eu, a UNICEF feature page, and a
+# Response Innovation Lab country page. All three organisations were live.
+
+RELINK_PENALTY = 15   # the listed page is gone, but the site it sat on is not
+
+
+def host_resolves(url):
+    """
+    False only when the hostname genuinely does not resolve.
+
+    A dangling CNAME looks like this: the record exists and points somewhere
+    that no longer does, so a lookup succeeds with no address. Any error other
+    than "no such host" is treated as unknown rather than absent, since a
+    resolver problem is not evidence about the project.
+    """
+    host = (urlparse(url).hostname or "").strip()
+    if not host:
+        return None
+    try:
+        socket.getaddrinfo(host, None)
+        return True
+    except socket.gaierror:
+        return False
+    except Exception:
+        return None
+
+
+def site_root(url):
+    """The scheme and host of a URL, or None when it has no path of its own."""
+    p = urlparse(url)
+    if not p.netloc or p.path.strip("/") == "":
+        return None
+    return "%s://%s/" % (p.scheme or "https", p.netloc)
+
+
+def probe_site(url):
+    """
+    What a failed fetch actually means.
+
+    Returns (alive, archived, verdict) where verdict is one of:
+      "ok"         the listed page answered
+      "relink"     the page is gone but its host answers, so the link is stale
+                   rather than the project being over
+      "no-host"    the hostname does not resolve
+      "gone"       the page failed and its host gives nothing better
+      "unknown"    nothing could be determined
+    """
+    alive, archived, why = check_website(url)
+    if alive is True:
+        return True, archived, "ok"
+    if alive is None:
+        # A wall is worth another attempt through a browser; a timeout is not.
+        return None, archived, "blocked" if why == "blocked" else "unknown"
+
+    if host_resolves(url) is False:
+        return False, archived, "no-host"
+
+    root = site_root(url)
+    if root:
+        root_alive, _, _ = check_website(root)
+        if root_alive is True:
+            return None, archived, "relink"
+
+    return False, archived, "gone"
 
 
 class GitHubRateLimited(Exception):
@@ -1409,9 +1545,35 @@ LAST_MODIFIED_MIN_AGE_DAYS = 2
 # JavaScript shell rather than a page. CTFG-curator uses the same threshold in
 # maybeRenderThinPage() before it re-reads the page through a browser.
 MIN_READABLE_PAGE_CHARS = 200
+# How long to wait before re-checking a site that failed, when the failure is
+# about to be written as a permanent verdict.
+RECHECK_PAUSE_S = 5
 # What a listing scores once its own page says it has finished. Matches the cap
 # an archive snapshot gets: both are the page telling us the thing is over.
 CLOSED_CAP = 10
+
+# Where the finding came from is part of the finding. A wording match is a rule
+# anyone can check; a reading is a judgement, and the breakdown says which one
+# this was so a project disputing it knows what to argue with. Written here as
+# one sentence with two openings because apply_adjudications.py rebuilds the
+# same breakdown line hours later, and two copies of this wording would drift.
+CLOSURE_SOURCE_WORDING = "The project's own page says"
+CLOSURE_SOURCE_READING = "A reading of the project's own page finds"
+
+
+def closure_sentence(source, phrase, capped=""):
+    """The breakdown line for a page that says the thing it describes is over."""
+    # The sentence supplies the quotation marks, so a phrase that arrives
+    # already quoted must not bring its own. A reading often quotes the page
+    # itself, and nesting the two produced a breakdown that opened on a double
+    # quote mark and read as a typo to anyone looking at the profile page.
+    phrase = re.sub(r'^[\s"\u201c\u201d\u00ab\u00bb\u2018\u2019]+|'
+                    r'[\s"\u201c\u201d\u00ab\u00bb\u2018\u2019]+$', "", str(phrase or ""))
+    phrase = phrase.replace('"', "\u201d")
+    return ('%s it has finished ("%s"), so it is not scored on how recently '
+            'that page changed%s' % (source, phrase, capped))
+
+
 WEBSITE_ALIVE_BONUS       = 15
 WEBSITE_ALIVE_BONUS_STALE = 5
 WEBSITE_BONUS_FRESH_DAYS  = 365
@@ -1577,11 +1739,82 @@ def readable_page(html, text_cap=12000, footer_cap=800):
     return {"footer": footer or None, "text": _clean(stripped)[:text_cap]}
 
 
-_MONTHS = {m.lower(): i for i, m in enumerate(
-    ["January", "February", "March", "April", "May", "June", "July",
-     "August", "September", "October", "November", "December"], 1)}
-for _full, _i in list(_MONTHS.items()):
-    _MONTHS[_full[:3]] = _i
+# Month names in the languages this directory actually meets. A date is a
+# recency signal whatever language the page is written in, and reading only
+# English ones meant a federal ministry publishing several times a week and a
+# département running a 2026 budget consultation were both recorded as pages
+# with no date on them at all.
+#
+# West and South Slavic month names are deliberately absent. They collide
+# across languages in the one way that matters: "listopad" is November in
+# Polish and October in Croatian, "srpanj" is July in Croatian while Czech
+# "srpen" is August, and nothing on the page says which language it is. Finding
+# no date is a safe answer and is already handled everywhere downstream. A date
+# eleven months out is not, because it is indistinguishable from a real one.
+_MONTH_NAMES = {
+    1:  "January enero janeiro janvier Januar Jänner gennaio januari januar "
+        "tammikuu Ocak ianuarie gener",
+    2:  "February febrero fevereiro février Februar febbraio februari februar "
+        "helmikuu Şubat februarie febrer",
+    3:  "March marzo março mars März marzo maart mars marts maaliskuu Mart "
+        "martie març",
+    4:  "April abril avril aprile april huhtikuu Nisan aprilie",
+    5:  "May mayo maio mai Mai maggio mei maj toukokuu Mayıs mayis maig",
+    6:  "June junio junho juin Juni giugno juni kesäkuu Haziran iunie juny",
+    7:  "July julio julho juillet Juli luglio juli heinäkuu Temmuz iulie juliol",
+    8:  "August agosto agosto août August agosto augustus augusti elokuu "
+        "Ağustos august agost",
+    9:  "September septiembre setiembre setembro septembre September settembre "
+        "syyskuu Eylül septembrie setembre",
+    10: "October octubre outubro octobre Oktober ottobre oktober lokakuu Ekim "
+        "octombrie octubre",
+    11: "November noviembre novembro novembre November novembre marraskuu "
+        "Kasım kasim noiembrie novembre",
+    12: "December diciembre dezembro décembre Dezember dicembre december "
+        "desember joulukuu Aralık aralik decembrie desembre",
+}
+
+_MONTHS = {}
+for _i, _names in _MONTH_NAMES.items():
+    for _n in _names.split():
+        _MONTHS[_n.lower()] = _i
+
+# Three-letter forms, generated rather than listed, then any that two different
+# months both claim is dropped. French "juin" and "juillet" both shorten to
+# "jui", and Finnish "marraskuu" collides with every language's March; keeping
+# either would turn a date the page states plainly into a wrong one.
+_prefixes = {}
+for _n, _i in _MONTHS.items():
+    if len(_n) > 3:
+        _prefixes.setdefault(_n[:3], set()).add(_i)
+for _p, _months in _prefixes.items():
+    if len(_months) == 1 and _p not in _MONTHS:
+        _MONTHS[_p] = next(iter(_months))
+
+# English abbreviations put back by hand, because the rule above drops "mar" to
+# protect against Finnish "marraskuu" and "Mar" is the single most common
+# abbreviation on the web. No Finnish page writes November as "mar"; Finnish
+# abbreviates its months as numbers.
+for _abbr, _i in {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                  "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10,
+                  "nov": 11, "dec": 12}.items():
+    _MONTHS[_abbr] = _i
+
+# A wrong month is worse than no month, so the table is checked at import rather
+# than trusted. Anything that would resolve two ways is a bug in the lists above.
+assert len(_MONTHS) == len(set(_MONTHS)), "duplicate month key"
+
+# Any Unicode letter, so "février", "März" and "Ağustos" are month names rather
+# than gibberish. [A-Za-z] silently truncated every accented name to the run of
+# plain letters inside it.
+_L = r"[^\W\d_]"
+
+# The day, with whatever a language puts after it: a dot in German and Finnish,
+# an ordinal suffix in English, "er" in French, a masculine ordinal in Iberian
+# and Italian writing.
+_DAY = r"(\d{1,2})(?:\.|st|nd|rd|th|er|º|°|ª)?"
+# "16 de septiembre de 2026", "16 di settembre", "16th of March".
+_OF = r"(?:\s+(?:de|di|of|d'))?"
 
 
 def _parse_date_loose(raw, now):
@@ -1594,20 +1827,24 @@ def _parse_date_loose(raw, now):
     s = _clean(raw)[:60]
     if not s:
         return None
-    dt = None
+
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)                       # ISO
     if m:
         y, mo, d = (int(g) for g in m.groups())
     else:
-        m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})", s)  # 20 March 2026
+        # 20 March 2026 / 16. September 2026 / 16 de septiembre de 2026
+        m = re.search(r"%s%s\s+(%s{3,12})\.?%s\s+(\d{4})" % (_DAY, _OF, _L, _OF), s, re.U)
         if m and m.group(2).lower() in _MONTHS:
             d, mo, y = int(m.group(1)), _MONTHS[m.group(2).lower()], int(m.group(3))
         else:
-            m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", s)  # March 20, 2026
+            m = re.search(r"(%s{3,12})\.?\s+(\d{1,2}),?\s+(\d{4})" % _L, s, re.U)  # March 20, 2026
             if m and m.group(1).lower() in _MONTHS:
                 mo, d, y = _MONTHS[m.group(1).lower()], int(m.group(2)), int(m.group(3))
             else:
-                return None
+                parsed = _parse_numeric_date(s)
+                if not parsed:
+                    return None
+                y, mo, d = parsed
     try:
         dt = datetime(y, mo, d, tzinfo=timezone.utc)
     except ValueError:
@@ -1617,18 +1854,72 @@ def _parse_date_loose(raw, now):
     return dt
 
 
+def _parse_numeric_date(s):
+    """
+    (y, m, d) from an all-digits date, or None when the order cannot be known.
+
+    16.09.2026 is read as day first. The dot form is European convention and is
+    not written the American way round, so it is safe to read on sight.
+
+    16/09/2026 is not. The slash form is day-first across most of the world and
+    month-first in the United States, and 05/06/2026 is a real date in both
+    readings, eleven months of error apart. So it is read only when one of the
+    first two numbers is over 12 and can therefore only be a day. An ambiguous
+    one returns None, which leaves the listing exactly where it would have been
+    before any of this existed.
+    """
+    m = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", s)
+    if m:
+        d, mo, y = (int(g) for g in m.groups())
+        return (y, mo, d) if 1 <= mo <= 12 else None
+
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", s)
+    if m:
+        a, b, y = (int(g) for g in m.groups())
+        if a > 12 and 1 <= b <= 12:
+            return (y, b, a)          # first number cannot be a month
+        if b > 12 and 1 <= a <= 12:
+            return (y, a, b)          # second cannot be, so the first is
+        return None                   # both under 13: unknowable, so not read
+    return None
+
+
 # Where a page states its own date, best evidence first.
 _META_DATE_PROPS = ["article:modified_time", "og:updated_time", "article:published_time",
                     "dateModified", "datePublished", "last-modified", "DC.date", "date"]
 
-# The capture is a lookahead so the match itself ends at the keyword. A page
-# that prints "Published: 6 January 2026 Last updated: 20 March 2026" as two
-# stacked lines collapses to one line of text once the tags are stripped, and a
-# consuming capture swallowed the second label with the first date — reporting
+# The words a page puts in front of its own date, in the languages above. The
+# capture is a lookahead so the match itself ends at the keyword. A page that
+# prints "Published: 6 January 2026 Last updated: 20 March 2026" as two stacked
+# lines collapses to one line of text once the tags are stripped, and a
+# consuming capture swallowed the second label with the first date, reporting
 # the older of the two as the page's date.
+#
+# Longest first, so "last updated" is not matched as "updated" and "última
+# atualização" is not matched as "atualizado".
+_DATE_LABELS = "|".join([
+    r"last\s+updated", r"last\s+modified", r"updated\s+on", r"published\s+on",
+    r"published", r"posted", r"updated",
+    r"zuletzt\s+aktualisiert", r"veröffentlicht\s+am", r"aktualisiert\s+am",
+    r"geändert\s+am", r"veröffentlicht", r"aktualisiert",
+    r"derni[èe]re\s+mise\s+[àa]\s+jour", r"mis\s+[àa]\s+jour\s+le",
+    r"mis\s+[àa]\s+jour", r"publi[ée]\s+le", r"modifi[ée]\s+le",
+    r"[úu]ltima\s+actualizaci[óo]n", r"actualizado\s+el", r"publicado\s+el",
+    r"modificado\s+el", r"actualizado", r"publicado",
+    r"[úu]ltima\s+atualiza[çc][ãa]o", r"atualizado\s+em", r"publicado\s+em",
+    r"ultimo\s+aggiornamento", r"aggiornato\s+il", r"pubblicato\s+il",
+    r"laatst\s+bijgewerkt", r"bijgewerkt\s+op", r"gepubliceerd\s+op",
+    r"senast\s+uppdaterad", r"uppdaterad", r"publicerad",
+    r"sist\s+oppdatert", r"oppdatert", r"publisert",
+    r"senest\s+opdateret", r"opdateret", r"offentliggjort",
+    r"p[äa]ivitetty", r"julkaistu",
+    r"son\s+g[üu]ncelleme", r"g[üu]ncellendi", r"yay[ıi]nland[ıi]",
+    r"ultima\s+actualizare", r"actualizat", r"publicat",
+])
+
 _TEXT_DATE_RE = re.compile(
-    r"(last\s+updated|last\s+modified|updated\s+on|published|posted)\s*[:\-–]?\s*"
-    r"(?=([0-9A-Za-z][^<\n|·•]{5,24}))", re.I)
+    r"(%s)\s*[:\-–]?\s*(?=([0-9%s][^<\n|·•]{5,32}))" % (_DATE_LABELS, _L[1:-1]),
+    re.I | re.U)
 
 
 def page_date_signals(html, headers, now, text=None):
@@ -1726,6 +2017,35 @@ RENDER_GOTO_MS    = 15_000
 RENDER_SETTLE_MS  = 2_500
 RENDER_TEXT_CAP   = 12_000
 
+# Headless Chromium says so in its own User-Agent, and a great many WAFs refuse
+# on that string alone. Measured on 20 sites that each returned 403 to a plain
+# fetch: with Playwright's default User-Agent, 6 of 20 rendered real content;
+# with this one, 13 of 20. The only difference is not announcing ourselves as a
+# headless browser. Nothing else here is disguised, the crawler is not pretending
+# to be a person, and a site that still says no is left alone.
+RENDER_USER_AGENT = os.environ.get(
+    "RENDER_USER_AGENT",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
+
+# The wall's own words. A challenge page is not short: the five that stayed
+# blocked in that test rendered between 256 and 686 characters, all of it above
+# MIN_READABLE_PAGE_CHARS, so length cannot tell a wall from a page. Reading one
+# as the project's own text would score Cloudflare's copyright year and
+# Cloudflare's wording as the project's.
+_BOT_WALL_RE = re.compile(
+    r"just a moment|checking your browser|enable javascript and cookies|"
+    r"verify (?:you are human|yourself)|are you a robot|access denied|"
+    r"attention required|performing security verification|"
+    r"you have been blocked|unusual traffic|ddos protection|"
+    r"request unsuccessful|pardon our interruption|"
+    r"security service to protect", re.I)
+
+
+def looks_like_bot_wall(text):
+    """True when the rendered text is the challenge page rather than the site."""
+    return bool(text) and bool(_BOT_WALL_RE.search(text[:1500]))
+
 _BROWSER = None
 _BROWSER_FAILED = False
 _PLAYWRIGHT = None
@@ -1785,7 +2105,7 @@ def render_page_text(url):
         return None
     page = None
     try:
-        page = browser.new_page()
+        page = browser.new_page(user_agent=RENDER_USER_AGENT)
 
         def _route(route):
             # Both calls have to swallow their own errors. A route that has
@@ -1826,6 +2146,78 @@ def render_page_text(url):
                 pass
 
 
+# ── Pages the rules cannot settle ─────────────────────────────────────────────
+#
+# Some questions do not reduce to a keyword. A conference closes registration
+# because it is about to happen; a consultation closes because it is over. Both
+# write "closed" on the page, and a subject list that tells them apart for one
+# gets the other wrong: a list containing "registration" retired a live
+# conference, and removing it lost a genuinely finished initiative whose page
+# said "Public voting closed on December 31, 2021".
+#
+# Those pages need reading, and reading is a model's job. It does not have to
+# happen while the sweep is running, though, and there are good reasons for it
+# not to. A call in the middle of scoring puts a paid API on the critical path
+# of a 200-record run, makes the run's cost a function of how many odd pages it
+# happened to meet, and gives the model's answer the same authority as a
+# regexp, written to Airtable in the same second with nothing between it and a
+# listing being retired.
+#
+# So the sweep queues instead. A page the rules cannot settle is written to
+# adjudication/queue.jsonl with its text and with what the run made of it
+# without any reading, and the run carries on. The reading is a separate pass
+# over that file, on hardware already paid for (adjudicate.mjs), and a verdict
+# that would retire a project is held for review rather than written.
+#
+# The record's own score is unaffected by the queueing: it is scored exactly as
+# it would have been had no model existed, which is also what it keeps if the
+# pass is never run. Nothing in the public breakdown mentions a pending
+# reading, deliberately: a line saying a verdict is coming would sit on the
+# profile page forever if the pass never came.
+
+ADJUDICATE          = os.environ.get("ADJUDICATE", "1") != "0"
+ADJUDICATION_DIR    = os.environ.get("ADJUDICATION_DIR", "adjudication")
+ADJUDICATION_QUEUE  = os.path.join(ADJUDICATION_DIR, "queue.jsonl")
+ADJUDICATE_PAGE_CAP = 6000
+
+
+def adjudication_candidate(name, url, text):
+    """
+    The page as a queue row, or None when there is nothing worth asking about.
+
+    Only the page and its address: what the run made of the record is added at
+    the end of compute_liveliness(), where the arithmetic is still in scope.
+    """
+    if not (ADJUDICATE and text and text.strip()):
+        return None
+    return {"name": name, "url": url, "text": text[:ADJUDICATE_PAGE_CAP]}
+
+
+def queue_adjudication(record_id, entry):
+    """
+    Append one page to the queue the local pass reads.
+
+    Appending, never rewriting: a run that is killed halfway keeps the rows it
+    had already written, and two runs can queue into the same file. Duplicate
+    record ids are expected, because the same listing comes round again on the
+    next sweep, and adjudicate.mjs rules the newest row for an id and drops the
+    rest: the older row's page text is months stale.
+
+    A queue that cannot be written is not a reason to fail a scoring run: the
+    scores are already correct without it.
+    """
+    try:
+        os.makedirs(ADJUDICATION_DIR, exist_ok=True)
+        row = dict(entry, id=record_id,
+                   queued=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        with open(ADJUDICATION_QUEUE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return True
+    except OSError as e:
+        print(f"    queue    → could not write {ADJUDICATION_QUEUE} ({e.strerror})")
+        return False
+
+
 # ── Pages that say the thing is over ──────────────────────────────────────────
 #
 # A date is not automatically a sign of life. "This questionnaire closed on
@@ -1840,9 +2232,16 @@ def render_page_text(url):
 # explicitly, and the generic patterns underneath require the sentence to be
 # about the thing itself having ended.
 
-_CLOSED_SUBJECTS = (r"questionnaire|survey|consultation|call for [a-z ]{3,20}|application[s]?|"
-                    r"submission[s]?|registration|nomination[s]?|entries|voting|poll|"
-                    r"programme|program|project|pilot|competition|contest|challenge|fund")
+# Only subjects whose closing means the thing itself is over. An intake window
+# shutting says nothing: a healthy conference closes registration precisely
+# because it is about to happen, and TrustCon was driven from 45 to 10 by its
+# own "Registration is Closed" banner while the site served fine and its footer
+# read 2026. Applications, nominations, entries, submissions, voting and
+# registration all close on schedule every year on programmes that are running,
+# so none of them belongs here.
+_CLOSED_SUBJECTS = (r"questionnaire|survey|consultation|"
+                    r"programme|program|project|pilot|initiative|campaign|"
+                    r"competition|contest|challenge|fund|service|platform|tool|site")
 
 _CLOSURE_PATTERNS = [
     # "This questionnaire closed on July 2, 2026" / "applications closed 1 March 2025"
@@ -1850,8 +2249,8 @@ _CLOSURE_PATTERNS = [
                r"(?:now )?(?:closed|ended|finished|concluded)\b" % _CLOSED_SUBJECTS, re.I),
     # "no longer accepting submissions", "we are no longer taking applications"
     re.compile(r"\bno longer (?:accepting|taking|open to|receiving)\b", re.I),
-    # "the deadline has passed", "submission deadline passed"
-    re.compile(r"\bdeadline (?:has )?(?:passed|expired)\b", re.I),
+    # A passed deadline is an intake window closing, not the thing ending, so it
+    # is no longer read as a closure on its own.
     # "this project has ended", "the programme is now closed"
     re.compile(r"\bthis (?:project|programme|program|pilot|initiative|campaign)\s+"
                r"(?:has |had )?(?:ended|closed|finished|concluded|wound down)\b", re.I),
@@ -2010,20 +2409,20 @@ def compute_liveliness(rec):
 
     if url_class == "skip":
         print(f"    website  → no usable URL ({(raw_url or 'none')[:60]})")
-        website_alive, is_archived = None, False
+        website_alive, is_archived, site_verdict = None, False, "unknown"
     elif url_class == "article":
         print(f"    website  → article URL detected, searching for homepage…")
         discovered_url = find_homepage_in_article(raw_url)
         if discovered_url:
             print(f"    website  → found homepage: {discovered_url}")
             website_url = discovered_url
-            website_alive, is_archived = check_website(discovered_url)
+            website_alive, is_archived, site_verdict = probe_site(discovered_url)
         else:
             print(f"    website  → could not find homepage from article")
-            website_alive, is_archived = None, False
+            website_alive, is_archived, site_verdict = None, False, "unknown"
     else:
-        website_alive, is_archived = check_website(raw_url)
-        print(f"    website  → alive={website_alive}  archived={is_archived}")
+        website_alive, is_archived, site_verdict = probe_site(raw_url)
+        print(f"    website  → alive={website_alive}  archived={is_archived}  {site_verdict}")
 
     # A dead site is NOT looked up in the Wayback Machine and its Website URL is
     # never replaced with a snapshot. Swapping in an archive link is the
@@ -2128,23 +2527,54 @@ def compute_liveliness(rec):
     page_copyright_year = None
     page_unreadable = False
     page_closed, page_closed_phrase = False, None
+    pending_adjudication = None
+
+    # A site behind a bot wall answered 403 or 429, which is the wall talking
+    # and says nothing about the project. Roughly two thirds of them serve their
+    # real page to a browser, so those get one, and what comes back is only
+    # believed when it is not the challenge page itself. A site that still says
+    # no stays exactly where it was: unread, and recorded as unread.
+    #
+    # This is the only place the browser is used on a page that did not answer.
+    # It is deliberately not extended to a timeout or a connection error, where
+    # there is nothing to render and the wait would be paid twice.
+    blocked_text = None
+    if website_url and site_verdict == "blocked" and not is_archived:
+        print(f"    website  → behind a bot check; trying a browser")
+        candidate = render_page_text(website_url)
+        if candidate and looks_like_bot_wall(candidate):
+            print(f"    render   → got the bot wall, not the site; left unread")
+        elif candidate and len(candidate) >= MIN_READABLE_PAGE_CHARS:
+            blocked_text = candidate
+            website_alive = True
+            print(f"    render   → {len(candidate)} chars past the wall")
+        elif candidate:
+            print(f"    render   → only {len(candidate)} chars past the wall; left unread")
+
     if website_url and website_alive is True:
         page_html, page_headers = get_page_cached(website_url)
-        if page_html:
+        # A page reached only through the browser has no HTML here: the fetch
+        # that would have filled the cache is the one the wall refused. Its
+        # rendered words are all there is, so they stand in for the page and the
+        # markup-based checks below simply find nothing, which is accurate.
+        if page_html is None and blocked_text:
+            page_html, page_headers = "", {}
+        if page_html is not None:
             # A site can answer and still say nothing. An app that paints itself
             # in the browser serves a shell: the questionnaire, the dates, the
             # notice that it closed months ago all arrive with the JavaScript,
             # and none of it is in the HTML. Reading no date off a shell is not
             # the same finding as reading no date off a page, so it is recorded
             # as its own fact rather than left to look like an absence.
-            readable = readable_page(page_html)["text"]
+            readable = blocked_text or readable_page(page_html)["text"]
             page_unreadable = len(readable) < MIN_READABLE_PAGE_CHARS
 
             # A shell is worth a second look through a browser, where the words
             # actually exist. Only a shell: the nine in ten pages that already
-            # read fine would pay for a render that told us nothing new.
-            rendered = None
-            if page_unreadable and not is_archived:
+            # read fine would pay for a render that told us nothing new. A page
+            # already rendered past a wall is not re-rendered.
+            rendered = blocked_text
+            if blocked_text is None and page_unreadable and not is_archived:
                 print(f"    page     → only {len(readable)} chars of text; rendering")
                 rendered = render_page_text(website_url)
                 if rendered and len(rendered) >= MIN_READABLE_PAGE_CHARS:
@@ -2159,6 +2589,15 @@ def compute_liveliness(rec):
             page_closed, page_closed_phrase = page_says_closed(page_html, now, text=rendered)
             if page_closed:
                 print(f"    page     → says it has closed: {page_closed_phrase!r}")
+            elif not page_unreadable and not page_signals:
+                # The wording check found nothing and neither did any date. This
+                # is the narrow band the rules cannot settle, so it is the only
+                # band worth queueing for a reading. The run does not wait for
+                # one: it scores this record as though no reading existed.
+                words = rendered if rendered is not None else readable
+                pending_adjudication = adjudication_candidate(name, website_url, words)
+                if pending_adjudication:
+                    print(f"    page     → nothing the rules can settle; queued for reading")
             if page_unreadable:
                 print(f"    page     → still unread after rendering")
             else:
@@ -2217,6 +2656,20 @@ def compute_liveliness(rec):
             else "Website is responding, but nothing dated and recent was found to go "
                  "with it",
             bonus, score - before))
+    elif site_verdict == "relink":
+        # The page is gone and its host is not. That is a stale link, not a
+        # dead project, and the two want opposite rulings, so it takes a much
+        # smaller penalty and says what a curator has to decide.
+        before = score
+        score  = max(score - RELINK_PENALTY, 0)
+        why.append(_adjustment(
+            "The page listed here is gone, but the site it sat on still answers, so "
+            "the link needs checking rather than the project being counted as over",
+            -RELINK_PENALTY, score - before))
+    elif site_verdict == "no-host":
+        before = score
+        score  = max(score - 50, 0)
+        why.append(_adjustment("The web address does not exist any more", -50, score - before))
     elif website_alive is False:
         before = score
         score  = max(score - 50, 0)  # strong signal of death
@@ -2228,6 +2681,13 @@ def compute_liveliness(rec):
         why.append("No website address on this listing to check")
     elif url_class == "skip":
         why.append("The listed address is not one that can be checked")
+    elif site_verdict == "blocked":
+        # Said out loud because it is a fact about the wall, not about the
+        # project, and a reader comparing two low scores should be able to tell
+        # "we could not look" from "we looked and found nothing".
+        why.append("The site is behind a bot check that refused both an ordinary "
+                   "request and a browser, so nothing on it could be read. This is "
+                   "not evidence either way about the project")
     else:
         why.append("Website could not be checked: it timed out or refused the request")
 
@@ -2298,10 +2758,8 @@ def compute_liveliness(rec):
     if page_closed:
         before = score
         score  = min(score, CLOSED_CAP)
-        why.append("The project's own page says it has finished (\"%s\"), so it is not "
-                   "scored on how recently that page changed%s"
-                   % (page_closed_phrase,
-                      "" if score == before else " (capped at %g)" % CLOSED_CAP))
+        capped = "" if score == before else " (capped at %g)" % CLOSED_CAP
+        why.append(closure_sentence(CLOSURE_SOURCE_WORDING, page_closed_phrase, capped))
 
     # Fully unknown: nothing could be checked at all
     no_signals = (best_date is None and website_alive is None and accessible_count == 0)
@@ -2324,10 +2782,107 @@ def compute_liveliness(rec):
     score  = round(score, 1)
     activity_status = "Unknown" if unknown else score_to_activity_status(score)
     status          = None      if unknown else score_to_status(score)
+
+    # A finished piece of work is N/A, and it outranks anything the signals say.
+    # A report does not stop being a report because the site hosting it went
+    # down, and Inactive on one reads as a project that ended, which is a claim
+    # about something that was never running in the first place. This used to be
+    # decided only by a sweep over the first hundred rows of the table, so a
+    # report outside that page was scored like a project and retired like one.
+    #
+    # is_na_candidate() carries the guard that keeps an organization which
+    # published something out of this: an ongoing type beside the Document wins.
+    if is_na_candidate(rec):
+        status = "N/A"
+        why.append("This listing is a finished piece of work rather than something "
+                   "that runs, so it is recorded as not applicable instead of being "
+                   "scored on how recently anything happened")
+
+    # Status "Inactive" is a claim that the thing is over, so it needs one of
+    # two kinds of evidence: it cannot be reached, or it says itself that it has
+    # finished. A page announcing that it has closed is the clearest signal
+    # there is and counts on its own, whatever the site still serves.
+    #
+    # Age is not that evidence. Plenty of listings are static resources — a
+    # guide, a dataset, a reference site — unchanged for years and perfectly
+    # usable because they are still up. A low score is the right reading of how
+    # much is happening there, and Activity status keeps carrying it; the score
+    # exists precisely so that case does not have to collapse into a binary.
+    if status == "Inactive":
+        says_finished = page_closed
+        # A relink is the one failure that is explicitly not a verdict: the
+        # organisation is still answering and only the link is stale, which is
+        # a curator's call to make and not one to write permanently.
+        unreachable   = ((website_alive is False) or is_archived or no_signals) \
+                        and site_verdict != "relink"
+
+        # A single failed fetch is not proof a site has gone. _try_fetch()
+        # already retries a connection error once, and a blip lasting seconds
+        # survives that: a federal ministry's site was recorded as not
+        # responding on one run and answered normally minutes later. Since this
+        # verdict removes the record from the queue for good, an unreachable
+        # site is checked once more before it counts, far enough after the first
+        # attempt to outlast a blip. Only the handful of records heading for
+        # Inactive pay for it.
+        if unreachable and website_alive is False and website_url:
+            time.sleep(RECHECK_PAUSE_S)
+            again, _, _ = check_website(website_url)
+            if again is not False:
+                why.append("The website did not answer when it was first checked but "
+                           "answered when it was tried again, so this is not recorded "
+                           "as inactive")
+                unreachable = False
+
+        if not (says_finished or unreachable):
+            why.append("The score is low, but the site still answers and nothing on it "
+                       "says the project has finished, so it is not recorded as "
+                       "inactive: a resource that is still up is still usable")
+            status = None
+    # What a "finished" verdict would make of this record, worked out here where
+    # the rest of the arithmetic is still in scope. The reading happens hours
+    # later against nothing but the queue file, so the alternative has to travel
+    # with the row: a score alone cannot be turned back into one, because a
+    # closure does not only cap the number. It also settles the question Unknown
+    # was reported for, so a record with nothing dated stops being Unknown and
+    # becomes a measurement. Only a listing with nothing checkable at all stays
+    # Unknown, and that is what no_signals already means.
+    if pending_adjudication is not None:
+        closed_score = round(min(score, CLOSED_CAP), 1)
+        pending_adjudication.update({
+            "score":                  None if unknown else score,
+            # The number before Unknown could clear it and before any cap, which
+            # is what tells the applier whether the closure cap actually moved
+            # anything or the score was already under it.
+            "raw_score":              score,
+            "activity_status":        activity_status,
+            "status":                 status,
+            # The reasons as they stand here, which is deliberately before the
+            # closing lines: the "nothing dated was found" paragraph and the
+            # Total are both answers to questions a closure re-opens, and a
+            # rebuilt breakdown wants them written fresh rather than stripped.
+            "reasons":                list(why),
+            "closed_score":           None if no_signals else closed_score,
+            "closed_activity_status": "Unknown" if no_signals
+                                      else score_to_activity_status(closed_score),
+            # A page that says it has finished is the evidence the Inactive
+            # guard above asks for, so score_to_status() is not second-guessed
+            # here the way it is for a low score with no such statement.
+            "closed_status":          None if no_signals
+                                      else score_to_status(closed_score),
+        })
+
     if unknown:
         score = None            # clears the field rather than publishing a number
 
-    if no_signals and is_archived:
+    if no_signals and site_verdict == "blocked":
+        # Distinct from the message below it on purpose. "No working website
+        # address" is false here: the address works and a wall is standing in
+        # front of it, which is a different thing for a curator to act on.
+        why = ["The website is behind a bot check that refused both an ordinary "
+               "request and a browser, and there is no code repository, feed or "
+               "reachable social account to go on instead. Nothing here is "
+               "evidence about whether the project is running."]
+    elif no_signals and is_archived:
         why = ["The address on this listing is an archive snapshot, and the original "
                "could not be reached to see whether the project is still there."]
     elif no_signals:
@@ -2355,6 +2910,7 @@ def compute_liveliness(rec):
         "status":             status,
         "breakdown":          breakdown,
         "discovered_url":     discovered_url,
+        "adjudication":       pending_adjudication,
     }
 
 
@@ -2396,10 +2952,19 @@ def main():
     parser = argparse.ArgumentParser(description="CTFG timeliness checker")
     parser.add_argument("--records", nargs="+", metavar="recXXX",
                         help="Specific record IDs to check (skips normal batch queue)")
+    # Scores everything and writes nothing. The queue file is still written,
+    # which is the point: it is how a batch of real pages is collected for the
+    # eval set without a run of the scorer landing on 200 live listings.
+    parser.add_argument("--no-write", action="store_true",
+                        help="Score and queue as normal, but send nothing to Airtable")
     args = parser.parse_args()
 
+    if args.no_write:
+        print("--no-write: nothing will be sent to Airtable. "
+              "Pages the rules cannot settle are still queued.\n")
+
     # Restore records a curator flagged as wrongly scored, before anything else
-    restored = restore_scored_wrong()
+    restored = [] if args.no_write else restore_scored_wrong()
     if restored:
         print(f"Restoring {len(restored)} wrongly scored record(s)...")
         for name, value, stale_score in restored:
@@ -2409,7 +2974,7 @@ def main():
         print()
 
     # Mark books/document listings as N/A before the normal timeliness check
-    na_records = fetch_na_candidates()
+    na_records = [] if args.no_write else fetch_na_candidates()
     if na_records:
         print(f"Marking {len(na_records)} books/document record(s) as N/A...")
         na_updates = [{"id": r["id"], "fields": {F_STATUS: "N/A"}} for r in na_records]
@@ -2441,6 +3006,8 @@ def main():
     print(f"Got {len(records)} records.\n")
     today        = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     updates      = []
+    queued       = 0
+    failed       = []
     rate_limited = False
 
     signal.signal(signal.SIGALRM, _record_timeout_handler)
@@ -2453,6 +3020,17 @@ def main():
             name = rec.get("fields", {}).get(F_NAME, rec["id"])
             print(f"\n  [{name}] ✗ exceeded {RECORD_TIME_BUDGET_S}s budget — marking checked without a score")
             result = None
+        except requests.RequestException as e:
+            # The network gave out on this record after its retries. One record
+            # is not worth the other thousand: it is left unstamped so it stays
+            # in the queue, and the run carries on. Nothing is written for it,
+            # deliberately, since a Last timeliness check with no score would
+            # advance the queue past a record nobody actually checked.
+            name = rec.get("fields", {}).get(F_NAME, rec["id"])
+            print(f"\n  [{name}] ✗ network failed ({type(e).__name__}) — skipped, "
+                  f"left in the queue")
+            failed.append((rec["id"], name, type(e).__name__))
+            continue
         except GitHubRateLimited as e:
             name = rec.get("fields", {}).get(F_NAME, rec["id"])
             print(f"\n  [{name}] ✗ {e} — stopping the run")
@@ -2473,6 +3051,17 @@ def main():
             fields[F_BREAKDOWN]       = result["breakdown"]
             if result["last_activity_date"]:
                 fields[F_LAST_ACTIVITY] = result["last_activity_date"]
+            # Status only where the reading is unambiguous. score_to_status()
+            # returns a value at 70 and above or under 20 and None in between,
+            # so a Likely Active or Possibly Inactive listing keeps whatever a
+            # curator put there. Held back until the scoring had been checked
+            # against edge cases; released 2026-09-15.
+            #
+            # Writing Inactive is one-way: is_excluded() skips a record whose
+            # Status is Inactive, so it leaves the queue and nothing re-scores
+            # it. A wrong one stays wrong with nothing to correct it.
+            if result["status"]:
+                fields[F_STATUS] = result["status"]
         else:
             # Timed out. Last timeliness check still advances so the record
             # cannot block the queue, which leaves the profile page saying it
@@ -2483,7 +3072,15 @@ def main():
         # Write each record as soon as it's done: a stalled or killed run keeps
         # its progress, and Last timeliness check always advances the queue
         # past a record that hangs.
-        at_patch(LISTINGS_TABLE, [{"id": rec["id"], "fields": fields}])
+        if not args.no_write:
+            at_patch(LISTINGS_TABLE, [{"id": rec["id"], "fields": fields}])
+
+        # Queued after the write, not before it: the row describes a record
+        # whose score is already in Airtable, so a run that dies between the
+        # two leaves a scored record and no queue row rather than the reverse.
+        if (result or {}).get("adjudication"):
+            if queue_adjudication(rec["id"], result["adjudication"]):
+                queued += 1
 
         update = {"id": rec["id"], "fields": fields}
         update["_discovered_url"] = (result or {}).get("discovered_url")  # stored locally, not sent to Airtable
@@ -2493,8 +3090,24 @@ def main():
     if rate_limited:
         print(f"\n✗ Stopped early — {len(updates)} record(s) written before the "
               f"GitHub rate limit was hit.\n")
+    elif args.no_write:
+        print(f"\n✓ Done — {len(updates)} record(s) scored, none written.\n")
     else:
         print(f"\n✓ Done — {len(updates)} record(s) written.\n")
+
+    if failed:
+        print(f"{len(failed)} record(s) were skipped because the network failed on them. "
+              f"They keep their place in the queue:")
+        for rid, name, why in failed[:20]:
+            print(f"  {rid}  {name} ({why})")
+        if len(failed) > 20:
+            print(f"  ... and {len(failed) - 20} more")
+        print()
+
+    if queued:
+        print(f"{queued} page(s) the rules could not settle were queued to "
+              f"{ADJUDICATION_QUEUE}. They are scored as though no reading existed; "
+              f"run adjudicate.mjs to read them.\n")
     print(f"{'Record ID':<20} {'Score':>7}  {'Activity status':<20}  {'Status':<10}  Last activity")
     print("-" * 80)
     for u in updates:

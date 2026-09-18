@@ -26,7 +26,7 @@ from datetime import date
 
 BASE, TABLE = "appYHxsLYleU2RVYk", "Listings"
 FIELDS = ("Project name", "Status", "Activity status", "Liveliness score",
-          "Last activity date", "Website URL", "False inactive")
+          "Last activity date", "Website URL", "False inactive", "Score breakdown")
 
 pat = os.environ.get("AIRTABLE_PAT") or os.environ.get("AIRTABLE_API_KEY")
 if not pat:
@@ -43,6 +43,27 @@ def score_to_status(score):
     if score < 20:
         return "Inactive"
     return None
+
+
+# Inactive needs the thing to be unreachable or to say itself that it has
+# finished; a low score on a site that still serves is not enough. The scorer
+# decides that from live state, which this cannot see, so it reads the stored
+# breakdown for the same findings.
+GONE_MARKERS = (
+    "Website did not respond",
+    "archive snapshot",
+    "Nothing on this listing could be checked",
+    "says it has finished",
+)
+
+
+def verdict(fields):
+    """What the scorer would write to Status for this record."""
+    status = score_to_status(fields.get("Liveliness score"))
+    if status != "Inactive":
+        return status
+    why = fields.get("Score breakdown") or ""
+    return "Inactive" if any(m in why for m in GONE_MARKERS) else None
 
 
 records, offset = [], None
@@ -69,7 +90,7 @@ to_inactive, to_active = [], []
 for rec in records:
     f = rec["fields"]
     now_status = f.get("Status")
-    would = score_to_status(f.get("Liveliness score"))
+    would = verdict(f)
     if would is None:
         moves["left alone (score between 20 and 70)"] += 1
         continue
