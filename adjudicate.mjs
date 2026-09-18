@@ -473,28 +473,34 @@ async function cmdRule() {
   console.log(`${work.length} page(s) to read, of ${queue.length} queued (${already.size} already ruled).`);
 
   const ruledAt = new Date().toISOString().slice(0, 19) + "Z";
+  const ledgerRow = (row, r) => ({
+    id: row.id, name: row.name, url: row.url,
+    queued: row.queued, ruled: ruledAt, model,
+    verdict: r.verdict, evidence: r.evidence, reason: r.reason,
+    // Carried through from the sweep so apply_adjudications.py can see what
+    // this ruling would change without re-running the scorer.
+    score: row.score, raw_score: row.raw_score,
+    activity_status: row.activity_status, status: row.status,
+    closed_score: row.closed_score,
+    closed_activity_status: row.closed_activity_status,
+    closed_status: row.closed_status,
+    reasons: row.reasons,
+  });
+
+  if (!dry) mkdirSync(DIR, { recursive: true });
+
+  // One append per ruling rather than one write at the end. A run that dies
+  // partway keeps every page it has already paid to read, and the next run
+  // skips those ids, so the cost of a crash is the page in flight.
   const { rulings, failures } = await rulePages(work, {
     model, concurrency: num("--concurrency", null),
-    onEach: dry ? (row, r) => console.log(`  ${r.verdict.padEnd(8)} ${row.name}: ${r.evidence || r.reason}`) : null,
+    onEach: dry
+      ? (row, r) => console.log(`  ${r.verdict.padEnd(8)} ${row.name}: ${r.evidence || r.reason}`)
+      : (row, r) => appendFileSync(LEDGER, JSON.stringify(ledgerRow(row, r)) + "\n"),
   });
 
   const tally = Object.fromEntries(VERDICTS.map(v => [v, 0]));
-  const ledgerRows = rulings.map(({ row, ...r }) => {
-    tally[r.verdict]++;
-    return {
-      id: row.id, name: row.name, url: row.url,
-      queued: row.queued, ruled: ruledAt, model,
-      verdict: r.verdict, evidence: r.evidence, reason: r.reason,
-      // Carried through from the sweep so apply_adjudications.py can see what
-      // this ruling would change without re-running the scorer.
-      score: row.score, raw_score: row.raw_score,
-      activity_status: row.activity_status, status: row.status,
-      closed_score: row.closed_score,
-      closed_activity_status: row.closed_activity_status,
-      closed_status: row.closed_status,
-      reasons: row.reasons,
-    };
-  });
+  for (const { verdict } of rulings) tally[verdict]++;
 
   if (dry) {
     console.log(`\nDry run, nothing written. ` +
@@ -502,9 +508,7 @@ async function cmdRule() {
     return;
   }
 
-  mkdirSync(DIR, { recursive: true });
-  appendFileSync(LEDGER, ledgerRows.map(r => JSON.stringify(r)).join("\n") + "\n");
-  console.log(`\n${ledgerRows.length} ruling(s) → ${LEDGER}`);
+  console.log(`\n${rulings.length} ruling(s) → ${LEDGER}`);
   console.log(`  ` + VERDICTS.map(v => `${tally[v]} ${v}`).join(", ") +
     (failures.length ? `, ${failures.length} failed and left in the queue` : ""));
   if (tally.finished) {
