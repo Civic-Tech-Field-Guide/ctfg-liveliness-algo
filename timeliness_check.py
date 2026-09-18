@@ -102,6 +102,7 @@ F_BREAKDOWN       = "fldf1lqGIoBc7qMWF"  # Score breakdown (created 2026-09-08)
 # AS_SCORED_WRONG; the next run restores the record's own Status value and
 # ticks F_FALSE_INACTIVE, which exempts it from all future scoring.
 F_FALSE_INACTIVE  = "fldaMAxokw1rgdwO5"  # False inactive (checkbox)
+F_POSTMORTEM      = "fldTdsLCxLtFaRgdL"  # Postmortem (url) - the page saying why it ended
 AS_SCORED_WRONG   = "Claude scored wrong"
 EXEMPT_SCORE      = 100  # score written to an exempted record
 
@@ -250,7 +251,7 @@ def get_category_slugs():
 def is_excluded(rec):
     """
     Returns True if the record should be skipped:
-    - Already marked Inactive (Status field)
+    - Already marked Inactive or N/A (Status field)
     - Curator has flagged a wrong verdict (False inactive)
     - Category is graveyard
     - New launch this year (marked 'x')
