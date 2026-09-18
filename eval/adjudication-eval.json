@@ -1,21 +1,21 @@
 {
   "openai/gpt-oss-120b": {
-    "ran": "2026-09-16T23:01:53Z",
+    "ran": "2026-09-17T10:11:36Z",
     "setSize": 35,
     "labelled": 35,
     "ruled": 35,
     "instances": 1,
-    "agreed": 27,
+    "agreed": 26,
     "failures": 0,
     "saidFinished": 0,
     "falseFinished": 0,
-    "trueFinished": 0,
+    "trueFinished": 1,
     "caughtFinished": 0,
     "matrix": {
       "finished": {
         "finished": 0,
         "running": 0,
-        "unclear": 0
+        "unclear": 1
       },
       "running": {
         "finished": 0,
@@ -25,7 +25,7 @@
       "unclear": {
         "finished": 0,
         "running": 4,
-        "unclear": 5
+        "unclear": 4
       }
     }
   }
