@@ -364,6 +364,8 @@ def fetch_batch():
     """
     eligible = []
     offset   = None
+    scanned  = 0
+    drained  = False
 
     # Pass 1: never checked — page through, oldest-created first within a page
     # (newer additions are more likely already active and less urgent to check)
@@ -376,16 +378,30 @@ def fetch_batch():
             params["offset"] = offset
         data = at_get(LISTINGS_TABLE, params)
         page = sorted(data.get("records", []), key=lambda r: r.get("createdTime", ""))
+        scanned += len(page)
         eligible.extend(r for r in page if not is_excluded(r))
         offset = data.get("offset")
         if len(eligible) >= BATCH_SIZE or not offset:
+            drained = not offset
             break
+
+    # A short batch is a fact about the queue rather than about the checker, and
+    # the two passes come up short for different reasons that call for different
+    # fixes. What each pass scanned and what it kept is the difference between a
+    # pool that has run out and a pool that is full of records excluded on every
+    # run: an excluded record is never scored, so it is never stamped, so it is
+    # scanned again tomorrow and the yield falls a little further each day.
+    print(f"  never-checked: kept {len(eligible)} of {scanned} scanned"
+          f"{' — pool exhausted' if drained else ''}")
+    kept_never_checked = len(eligible)
 
     # Pass 2: oldest checked (only if the never-checked pool came up short)
     if len(eligible) < BATCH_SIZE:
         # Airtable caps pageSize at 100 and rejects anything larger, so page
         # through rather than asking for a batch's worth in one call.
-        offset2 = None
+        offset2  = None
+        scanned2 = 0
+        drained2 = False
         for _ in range(CHECKED_MAX_PAGES):
             params2 = {
                 "filterByFormula": f'{{{_field_name(F_LAST_CHECK)}}} != ""',
@@ -396,10 +412,15 @@ def fetch_batch():
             if offset2:
                 params2["offset"] = offset2
             data2 = at_get(LISTINGS_TABLE, params2)
-            eligible.extend(r for r in data2.get("records", []) if not is_excluded(r))
+            page2 = data2.get("records", [])
+            scanned2 += len(page2)
+            eligible.extend(r for r in page2 if not is_excluded(r))
             offset2 = data2.get("offset")
             if len(eligible) >= BATCH_SIZE or not offset2:
+                drained2 = not offset2
                 break
+        print(f"  oldest-checked: kept {len(eligible) - kept_never_checked} "
+              f"of {scanned2} scanned{' — table exhausted' if drained2 else ''}")
 
     return eligible[:BATCH_SIZE]
 
